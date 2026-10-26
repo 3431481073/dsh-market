@@ -5028,6 +5028,23 @@ sendJson(response, 200, { updates })
             // runs. Write the intent first, so the log can answer "where did
             // my plugin go" after the fact.
             logEvent('info', 'update-start', `${name} -> ${target} (profile ${config.profile})`)
+            // A live hot mount is an include tree holding an ABSOLUTE file URL
+            // into node_modules. pnpm replaces that directory while the tree
+            // is still mounted, and the tree's next import of the old path
+            // fails with ERR_MODULE_NOT_FOUND — reported as THIS update's
+            // failure, rolled back, every time (#1022). Drop the mount first:
+            // the files are about to be replaced anyway, and the market
+            // already tells the user the new build needs a restart.
+            // Only a package the profile's bundle layer composes again is
+            // dropped: that is the one whose mount comes back on the next
+            // start, and the one the report is about — the market re-adds a
+            // newly enabled plugin to that list itself (#696). A mount with no
+            // durable row behind it is the only thing keeping such a package
+            // running, so this leaves it alone.
+            if (listHotMounts().includes(name) && readProfileBundles(activeProfileDir).includes(name)) {
+              const dropped = await hotUnmount(name)
+              logEvent('info', 'update', `${name}: hot mount dropped before the files are replaced (#1022)${dropped ? '' : ' (no live handle)'}`)
+            }
             // Even when a candidate was mature during validation, pnpm may
             // reject the operation because another lockfile entry is young or
             // the registry changes. Never retry this update with an age bypass.

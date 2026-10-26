@@ -2491,6 +2491,40 @@ describe('update flow — no npm publishing required', () => {
     expect(readManifestAt(fake.profileDir).dependencies?.mnemon).toBe('^0.2.9')
   })
 
+  /**
+   * #1022: a live hot mount is an include tree whose rows name ABSOLUTE file
+   * URLs into node_modules. Updating replaced that directory under the tree,
+   * and the tree's next import of the old path failed with
+   * ERR_MODULE_NOT_FOUND — which the route reported as this update failing
+   * and rolled back, every time.
+   */
+  it('drops a live hot mount before the files it points at are replaced (#1022)', async () => {
+    // A real bundle plugin: the bundle layer composes it again on restart,
+    // which is what makes dropping the mount a swap rather than a removal.
+    const bundleManifest = { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'lib/index.js' }
+    const bundlePatch = "- insert:\n    - id: dsh-loop\n      name: 'dsh-loop'\n"
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: bundleManifest, artifacts: ['lib/index.js', 'cordis.patch.yml'], artifactContents: { 'cordis.patch.yml': bundlePatch } } },
+    }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    const manifestPath = join(fake.profileDir, 'package.json')
+    const manifest = readManifestAt(fake.profileDir)
+    manifest.dsh = { ...(manifest.dsh ?? {}), profile: { bundles: ['dsh-loop'] } }
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+    expect(hot.mounts).toContain('dsh-loop')
+
+    advanceNpmLatest('1.2.0')
+    fake.npm['dsh-loop'].versions['1.2.0'] = { manifest: bundleManifest, artifacts: ['lib/index.js', 'cordis.patch.yml'], artifactContents: { 'cordis.patch.yml': bundlePatch } }
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status, JSON.stringify(r.json)).toBe(200)
+    // The mount is gone BEFORE pnpm runs: it points at files about to be
+    // replaced, and the market already says the new build needs a restart.
+    expect(hot.mounts).not.toContain('dsh-loop')
+  })
+
   it('still updates a plugin that declares a dsh surface — the refusal is not a blanket one (#793)', async () => {
     advanceNpmLatest('1.2.0')
     const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
