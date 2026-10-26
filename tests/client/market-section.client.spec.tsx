@@ -3702,6 +3702,65 @@ describe('long installed names stay readable (#342, #343)', () => {
   })
 })
 
+describe('card hover does not cover footer actions (#1021)', () => {
+  it('does not open a covering introduction, and comments and favorite still work', async () => {
+    // #996's hover peek portaled a sheet over the card after 420ms. The
+    // title and Install stayed visible; comments and favorite sit in the
+    // footer, under that sheet. Resting on a card must not create the
+    // sheet, and both footer actions must still do their job.
+    render(<MarketSection {...props()} />)
+    const name = await screen.findByText('dsh-loop')
+    const card = name.closest('[class*="card"]') as HTMLElement
+    expect(within(card).getByRole('button', { name: en.favoriteAdd })).toBeTruthy()
+    expect(within(card).getByRole('button', { name: en.comments })).toBeTruthy()
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.pointerEnter(card)
+      await act(async () => { await vi.advanceTimersByTimeAsync(420) })
+      expect(document.querySelector('[class*="introPanel"]')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+
+    fireEvent.click(within(card).getByRole('button', { name: en.favoriteAdd }))
+    await waitFor(() => {
+      const call = fetchCalls.find(c => c.path === '/dsh-market/favorite')
+      expect(call?.body).toEqual({ url: 'https://github.com/alice/dsh-loop', favorited: true })
+    })
+    fireEvent.click(within(card).getByRole('button', { name: en.comments }))
+    await screen.findByRole('dialog', { name: `${en.commentsTitle} — dsh-loop` })
+  })
+})
+
+describe('discover card download count stays compact', () => {
+  it('shows the count on the card; the period stays in the tooltip', async () => {
+    // #996 put " / 30d" on every byline. That string is already in the
+    // tooltip, and on a two-up card it wraps the author row onto three lines.
+    const plugin = {
+      ...REGISTRY.plugins[0]!,
+      downloads: 182400,
+      downloadsStart: '2026-09-01',
+      downloadsEnd: '2026-09-30',
+      downloadsCheckedAt: '2026-10-01',
+    }
+    stubFetch({
+      '/dsh-market/registry': {
+        source: 'live',
+        hostVersion: '0.1.2-alpha.2',
+        registry: { ...REGISTRY, count: 1, plugins: [plugin] },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    const card = (await screen.findByText('dsh-loop')).closest('[class*="card"]') as HTMLElement
+    expect(within(card).getByText('· ↓ 182.4k')).toBeTruthy()
+    expect(within(card).queryByText(re(en.downloadsPeriod))).toBeNull()
+    const tip = downloadStatsText(plugin, props().t)
+    expect(tip).toBeTruthy()
+    expect(within(card).getByLabelText(tip!)).toBeTruthy()
+  })
+})
+
 describe('favorites (#414)', () => {
   function favoritesStub(initial: string[] = [], installed: Record<string, string> = {}) {
     const state = { favorites: [...initial] }
@@ -7858,7 +7917,7 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     render(<MarketSection {...props()} />)
     await screen.findByText('dsh-loop')
     const count = screen.getByLabelText(/npm rolling 30-day downloads: 4200/)
-    expect(count.textContent).toContain('4.2k / 30d')
+    expect(count.textContent).toBe('· ↓ 4.2k')
     expect(count.getAttribute('tabindex')).toBe('0')
     expect(count.getAttribute('aria-label')).toContain('2026-08-25 to 2026-09-23')
     expect(count.getAttribute('aria-label')).toContain('2026-09-24')
