@@ -3424,15 +3424,23 @@ export function MarketSection(props: MarketSectionProps) {
     // pluginBlocked closes over the installed map and the catalog match.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [pluginsAll, blockedNameSet, installed, repoIdentities, data, repoHints])
+  // A sort the user chose is a request to see the list in THAT order, and
+  // this block ignores the sort by design (it is "what was added in the last
+  // seven days", ordered by downloads). Left in place it sits between the
+  // control and the list it just reordered: on a 1166px window it fills the
+  // screen, so switching to Stars looked like it did nothing (#1016). The
+  // block is a front-page teaser for the unfiltered default view — one more
+  // narrowing, alongside query, category and time range.
   const recentlyAdded = useMemo(
     () => data === null || tab !== 'discover' || q.trim() !== '' || cat !== 'all' || timeRange !== 'all'
+      || sortField !== 'downloads' || sortDir !== 'desc'
       ? []
       : visiblePlugins(data.plugins, {
           category: 'all', query: '', lang, sort: 'downloads-desc', sinceDays: 7,
           hostCompatibility, compatibleWithHost,
         }).filter(plugin => !pluginBlocked(plugin)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [data, tab, q, cat, timeRange, lang, hostCompatibility, compatibleWithHost, blockedNameSet, installed, repoIdentities, repoHints])
+    [data, tab, q, cat, timeRange, sortField, sortDir, lang, hostCompatibility, compatibleWithHost, blockedNameSet, installed, repoIdentities, repoHints])
   const recentRowRef = useRef<HTMLDivElement>(null)
   // Two per row, like the grid below it: three across read as a different
   // list rather than the same one (and left an odd one out at any width).

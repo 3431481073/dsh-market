@@ -8873,7 +8873,10 @@ describe('recently added Discover row (#780)', () => {
       const main = rankedNames(container)
       expect(main.indexOf('cutoff')).toBeLessThan(main.indexOf('recent-high'))
     })
-    expect(names(recent())).toEqual(recentNames.slice(0, 4))
+    // The block is the DEFAULT view's teaser and ignores the sort, so it steps
+    // aside once the user asks for an order: left above the list it hid the
+    // reorder behind a screenful of unchanged cards (#1016).
+    expect(screen.queryByRole('region', { name: en.recentlyAdded })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: en.filter }))
   })
 
@@ -8896,6 +8899,12 @@ describe('recently added Discover row (#780)', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: en.timeWeek }))
     expectHidden()
     fireEvent.click(screen.getByRole('menuitem', { name: en.timeAll }))
+    await screen.findByRole('region', { name: en.recentlyAdded })
+    // A chosen order is one more narrowing: this block is the default view's
+    // teaser, not a header on a sorted list (#1016).
+    fireEvent.click(screen.getByRole('menuitem', { name: en.sortStars }))
+    expectHidden()
+    fireEvent.click(screen.getByRole('menuitem', { name: en.sortDownloads }))
     await screen.findByRole('region', { name: en.recentlyAdded })
     fireEvent.click(screen.getByRole('button', { name: en.filter }))
     for (const tab of [en.tabThemes, en.tabFavorites, en.tabInstalled, en.tabBlocked, en.tabAdvanced]) {

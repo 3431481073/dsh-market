@@ -10108,7 +10108,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				data,
 				repoHints
 			]);
-			const recentlyAdded = (0, react.useMemo)(() => data === null || tab !== "discover" || q.trim() !== "" || cat !== "all" || timeRange !== "all" ? [] : visiblePlugins(data.plugins, {
+			const recentlyAdded = (0, react.useMemo)(() => data === null || tab !== "discover" || q.trim() !== "" || cat !== "all" || timeRange !== "all" || sortField !== "downloads" || sortDir !== "desc" ? [] : visiblePlugins(data.plugins, {
 				category: "all",
 				query: "",
 				lang,
@@ -10122,6 +10122,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				q,
 				cat,
 				timeRange,
+				sortField,
+				sortDir,
 				lang,
 				hostCompatibility,
 				compatibleWithHost,
