@@ -692,6 +692,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			stateDependencyLibrary: "{0} 的依赖库",
 			stateLoadedByProfile: "由你的配置加载",
 			stateBroken: "已安装，校验未通过",
+			stateFailed: "启动时没能加载",
 			stateDisabled: "已停用",
 			phaseResolving: "准备依赖",
 			phaseDownloading: "下载中",
@@ -1452,6 +1453,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			stateDependencyLibrary: "Library for {0}",
 			stateLoadedByProfile: "Loaded by your setup",
 			stateBroken: "Installed, verification failed",
+			stateFailed: "Did not load at start",
 			stateDisabled: "Disabled",
 			phaseResolving: "Preparing dependencies",
 			phaseDownloading: "Downloading",
@@ -6968,6 +6970,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			};
 			if (state === "broken") return {
 				label: t("stateBroken"),
+				dot: "error"
+			};
+			if (state === "failed") return {
+				label: t("stateFailed"),
 				dot: "error"
 			};
 			if (state === "disabled") return {

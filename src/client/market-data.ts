@@ -323,7 +323,7 @@ export function restartHintKey(state: {
 }
 
 /** Post-install activation state (P0-2), per installed package. */
-export type ActivationState = 'live' | 'restart' | 'incompatible' | 'inert' | 'broken' | 'missing' | 'disabled'
+export type ActivationState = 'live' | 'restart' | 'incompatible' | 'inert' | 'broken' | 'failed' | 'missing' | 'disabled'
 
 export interface ActivationInfo {
   state: ActivationState

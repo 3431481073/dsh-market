@@ -163,6 +163,9 @@ function activationMeta(
   if (state === 'incompatible') return { label: t('stateIncompatible'), dot: 'error' }
   if (state === 'inert') return { label: t('stateInert'), dot: 'warning' }
   if (state === 'broken') return { label: t('stateBroken'), dot: 'error' }
+  // The host's loader made a row for it and never started one (#1023): not a
+  // pending change, so it must not read like one.
+  if (state === 'failed') return { label: t('stateFailed'), dot: 'error' }
   if (state === 'disabled') return { label: t('stateDisabled'), dot: 'warning' }
   return { label: '—', dot: 'warning' }
 }

@@ -1223,8 +1223,38 @@ export function mountMarketRoutes(
     return live
   }
 
+  /**
+   * The host's own rows for a package, as the loader holds them right now.
+   *
+   * Rows the MARKET created are left out (`mkt-` ids, see `hotMount`): a hot
+   * mount that failed in this session also leaves an entry without a fiber,
+   * and that one really does come back on the next start (#575).
+   */
+  function loaderRowsOf(name: string): { disabled: boolean; live: boolean }[] {
+    const entries = [...host.loader.entries()]
+    const ownedRows = new Set(rowIdsForPackage(host, activeProfileDir, name))
+    const mine = (entry: (typeof entries)[number]): boolean => {
+      const id = typeof entry.options.id === 'string' ? entry.options.id : ''
+      const bare = id.split(':').pop() ?? id
+      if (bare.startsWith('mkt-')) return false
+      const entryName = entry.options.name
+      if (typeof entryName === 'string' && (entryName === name || packageOfEntryName(entryName) === name)) return true
+      return ownedRows.has(bare)
+    }
+    return entries.filter(mine).map(entry => {
+      let disabled = false
+      try {
+        disabled = entry.disabled === true
+      } catch { /* an expression that cannot be evaluated is not a switch */ }
+      return { disabled, live: entry.fiber !== undefined }
+    })
+  }
+
   /** A disabled loader row has no fiber but still makes its package switchable. */
   function loaderEntryObserved(name: string): boolean {
+    // `loaderRowsOf` is the single reader: two callers disagreeing about what
+    // "observed" means is how a row ends up switchable and not-switchable at
+    // once (#1023).
     const entries = [...host.loader.entries()]
     if (entries.some(entry => {
       const entryName = entry.options.name
@@ -1235,6 +1265,18 @@ export function mountMarketRoutes(
       const id = entry.options.id
       return typeof id === 'string' && ownedRows.has(id.split(':').pop() ?? id)
     })
+  }
+
+  /**
+   * Rows the loaders made for this package and never started (#1023).
+   *
+   * Only a row this START created counts: the market's own hot mounts are
+   * excluded (they retry on the next start), and a package with no row at all
+   * is the ordinary "restart to apply" case, not this one.
+   */
+  function loaderNeverStarted(name: string): boolean {
+    const rows = loaderRowsOf(name)
+    return rows.length > 0 && rows.every(row => !row.live && !row.disabled)
   }
 
   function isNonToggleableLibrary(name: string): boolean {
@@ -2814,7 +2856,8 @@ export function mountMarketRoutes(
             verifyActivation(config.profile, name, live, activeProfileDir,
               disabled.has(name) || patchFlags.disabled.includes(name) || unbundled.includes(name),
               undefined,
-              isDeclaredLibraryDsh(manifest?.dsh) && loaderEntryObserved(name)),
+              isDeclaredLibraryDsh(manifest?.dsh) && loaderEntryObserved(name),
+              loaderNeverStarted(name)),
             replacedWhileLive.has(name),
           )
           // A package with no dsh surface of its own, outside the bundle

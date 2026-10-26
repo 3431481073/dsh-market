@@ -2053,6 +2053,47 @@ describe('install flow', () => {
     expect(r.json.activation['dsh-loop']?.state).toBe('incompatible')
   })
 
+  /**
+   * #1023: "1 change needs a restart" that no restart could clear. The host
+   * had a row for the plugin and never started it, and the market read the
+   * row's absence of a fiber as "restart to apply" — which the next start
+   * reproduced, every time.
+   */
+  it('reads a host row that never started as failed, and keeps a failed hot mount restartable (#1023)', async () => {
+    fake.repos['github:o/dsh-patchy'] = {
+      name: 'dsh-patchy',
+      manifest: { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'lib/index.js' },
+      artifacts: ['lib/index.js', 'cordis.patch.yml'],
+    }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-patchy' })
+    writeFileSync(join(profileDir('web'), 'node_modules', 'dsh-patchy', 'cordis.patch.yml'),
+      "- insert:\n    - id: dsh-patchy\n      name: 'dsh-patchy'\n")
+    // The boot-time shape: the package is in the profile's bundle layer, so
+    // the host composes its row on every start.
+    const manifestPath = join(profileDir('web'), 'package.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { ...(manifest.dsh ?? {}), profile: { ...(manifest.dsh?.profile ?? {}), bundles: ['dsh-patchy'] } }
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+    hot.mounts = []
+    // The host's own row: created, never started.
+    const hostRow = { options: { id: 'dsh-patchy', name: 'dsh-patchy' } as never, fiber: undefined, update: vi.fn() }
+    bed.loaderEntries.push(hostRow as never)
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.activation['dsh-patchy']).toMatchObject({ state: 'failed', bundle: true, hot: false })
+
+    // The same package, but the row is the MARKET's own hot mount that failed
+    // in this session: a restart really does retry that one (#575).
+    bed.loaderEntries.length = 0
+    bed.loaderEntries.push({ options: { id: 'mkt-dsh-patchy', name: 'dsh-patchy' } as never, fiber: undefined, update: vi.fn() } as never)
+    const again = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(again.json.activation['dsh-patchy']).toMatchObject({ state: 'restart', bundle: true })
+
+    // A row that IS up is live, whatever else the route was told (#135).
+    bed.loaderEntries[0]!.fiber = {}
+    const live = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(live.json.activation['dsh-patchy']).toMatchObject({ state: 'live', hot: true })
+  })
+
   it('refuses to enable a peer-incompatible plugin and names the way out (#758)', async () => {
     fake.npm['dsh-loop'] = {
       latest: '1.2.0',
