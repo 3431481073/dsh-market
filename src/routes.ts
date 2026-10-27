@@ -7151,7 +7151,13 @@ sendJson(response, 200, { updates })
                   // where the button is not (#314). The panel now carries
                   // the action on this very row, so the text can just say
                   // what to press.
-                  ? `构建脚本被 pnpm 默认拦截（${ignoredBuilds.join(', ')}），点击「放行构建脚本并重试」即可放行并重装 / build scripts are blocked by pnpm by default (${ignoredBuilds.join(', ')}); use "Allow build scripts and retry" to approve and reinstall`
+                  // #1034: pnpm reports every undecided build in the
+                  // workspace, not only the ones this operation needed — an
+                  // entry left from an earlier install shows up here too, and
+                  // saying "this install needs dsh-purge approved" was wrong
+                  // for a plugin that never depended on it. Name them as
+                  // decisions, with where the decision is written.
+                  ? `pnpm 要求先决定这些依赖能否运行构建脚本（${ignoredBuilds.join(', ')}）：有的是这次安装带进来的，也可能是之前留下的未决定条目。点「放行构建脚本并重试」会把它们写进 pnpm-workspace.yaml 的 allowBuilds，然后重新安装 / pnpm wants a decision on these packages before it runs their build scripts (${ignoredBuilds.join(', ')}); some came in with this install, and some may be entries an earlier one left undecided. "Allow build scripts and retry" writes them into allowBuilds in pnpm-workspace.yaml and installs again`
                   // Same last resort as the update route (#848), and on THIS
                   // route too: a recognized failure like an expired
                   // `patchedDependencies` key had no branch here either.
