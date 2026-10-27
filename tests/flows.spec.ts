@@ -2390,6 +2390,39 @@ describe('update flow — no npm publishing required', () => {
     })
   }
 
+  it('leaves a bystander with its bundle row after a failed update restores nothing (#1040)', async () => {
+    // The rollback rewrites the manifest through pnpm and the plugin command,
+    // neither of which carries rows it did not own. A bystander kept its
+    // dependency and its files but lost its dsh.profile.bundles row, so it
+    // silently stopped loading on the next boot while the failure the user
+    // saw was about something else.
+    const other = join(fake.profileDir, 'node_modules', 'dsh-manual')
+    mkdirSync(other, { recursive: true })
+    writeFileSync(join(other, 'package.json'), JSON.stringify({ name: 'dsh-manual', version: '0.21.1', dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+    const manifest = readManifestAt(fake.profileDir)
+    writeFileSync(join(fake.profileDir, 'package.json'), JSON.stringify({
+      ...manifest,
+      dependencies: { ...manifest.dependencies, 'dsh-manual': '^0.21.1' },
+      dsh: { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: [...(manifest.dsh?.profile?.bundles ?? []), 'dsh-manual'] } },
+    }))
+    advanceNpmLatest('1.2.0')
+    fake.dropBundleRowAfterAdd = 'dsh-manual'
+    // Twice: the update AND the rollback reinstall, which is the reporter's
+    // "restoration of the previous build could not be verified".
+    fake.failNextAddStderrOnce = '[ERR_PNPM_FETCH_404] 404 Not Found - GET https://registry.npmjs.org/dsh-loop'
+    fake.failNextAddStderrTimes = 2
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(502)
+    // Nobody asked for this row to go, and the package is still on disk, so
+    // the row is what the user had before the operation. This is the
+    // invariant; which of the two repairs delivers it (the rollback's own
+    // manifest restore, or #1040's explicit put-back when that restore could
+    // not be verified) depends on how far the rollback got.
+    expect(readManifestAt(fake.profileDir).dsh?.profile?.bundles ?? []).toContain('dsh-manual')
+  })
+
   it('names a bundle row that vanished from a package the update was not about (#720)', async () => {
     // The report: after an update the profile still declared a manually
     // installed plugin and still had it on disk, but its row was gone from
