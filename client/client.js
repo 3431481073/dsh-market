@@ -589,6 +589,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			marketUpdate: "更新插件市场",
 			updateAll: "全部更新",
 			heldReleaseNotice: "已安装，但不是最新版：这个 profile 的 minimumReleaseAge 挡住了 {0}，安装的是 {1}。",
+			versionUnverifiedNote: "已安装，但版本没能确认：registry 两次都查不到，这次装的是 {0}。插件页会显示实际版本，可以在那里核对。",
+			versionUnverifiedNoteUnknown: "已安装，但版本没能确认：registry 两次都查不到。插件页会显示实际版本，可以在那里核对。",
 			installedDependencyNote: "另有 {0} 个包是插件带进来的依赖，不是插件，未列在上方。",
 			heldReleaseAction: "仍安装 {0}",
 			ignoreUpdateNotice: "重启前不再提醒",
@@ -1352,6 +1354,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			marketUpdate: "Update the plugin market",
 			updateAll: "Update all",
 			heldReleaseNotice: "Installed, but not the newest: this profile's minimumReleaseAge held {0} back, so {1} was installed.",
+			versionUnverifiedNote: "Installed, but the version could not be confirmed: both registry lookups failed, so {0} is what pnpm chose. The plugin page shows the version actually on disk.",
+			versionUnverifiedNoteUnknown: "Installed, but the version could not be confirmed: both registry lookups failed. The plugin page shows the version actually on disk.",
 			installedDependencyNote: "{0} more packages came in as dependencies of plugins — they are not plugins, so they are not listed above.",
 			heldReleaseAction: "Install {0} anyway",
 			ignoreUpdateNotice: "Don't remind until restart",
@@ -2114,6 +2118,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			marketUpdate: "プラグインマーケットを更新",
 			updateAll: "すべて更新",
 			heldReleaseNotice: "インストールしましたが、最新版ではありません。この profile の minimumReleaseAge が {0} を保留したため、{1} がインストールされました。",
+			versionUnverifiedNote: "インストールしましたが、バージョンを確認できませんでした。レジストリの照会が 2 回とも失敗したため、pnpm が選んだ {0} が入っています。実際のバージョンはプラグイン画面で確認できます。",
+			versionUnverifiedNoteUnknown: "インストールしましたが、バージョンを確認できませんでした。レジストリの照会が 2 回とも失敗しました。実際のバージョンはプラグイン画面で確認できます。",
 			installedDependencyNote: "ほかに {0} 個のパッケージが、プラグインの依存として取り込まれています。それらはプラグインではないため、上には表示されません。",
 			heldReleaseAction: "それでも {0} をインストール",
 			ignoreUpdateNotice: "再起動するまで通知しない",
@@ -11562,7 +11568,11 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						return;
 					}
 					if (status === 200 && body.ok) {
-						setRecords((list) => patch(list, updateRecordId, { state: "done" }));
+						const unverified = body.versionUnverified !== null && typeof body.versionUnverified === "object" ? body.versionUnverified : null;
+						setRecords((list) => patch(list, updateRecordId, unverified === null ? { state: "done" } : {
+							state: "warned",
+							reason: typeof unverified.installed === "string" && unverified.installed !== "" ? t("versionUnverifiedNote").replace("{0}", unverified.installed) : t("versionUnverifiedNoteUnknown")
+						}));
 						setUpdatedNames((names) => names.concat(name));
 						const activation = body.activation && typeof body.activation === "object" ? body.activation[name] : void 0;
 						if (!activation || activation.state === "restart") setRestartNames((names) => names.includes(name) ? names : names.concat(name));

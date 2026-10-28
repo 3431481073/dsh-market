@@ -4661,6 +4661,8 @@ sendJson(response, 200, { updates })
             const selfChannel = SELF_NAMES.has(name) ? activeChannel() : null
             const tag = selfChannel === null ? 'latest' : DIST_TAG[selfChannel]
             let expectedNpmVersion: string | null = null
+            /** The target could not be pinned because registry lookups failed (#1047). */
+            let versionUnverified = false
             let enforceMatureReleaseAge = false
             // Resolve the registry pin BEFORE building the add target (#496).
             // Desktop's install boundary otherwise fetches `latest` again to
@@ -4794,6 +4796,15 @@ sendJson(response, 200, { updates })
                 ? await fetchNpmLatest(name)
                 : await versionOnChannel(name, selfChannel, await fetchNpmLatest(name)))
               if (expectedNpmVersion === null) expectedNpmVersion = registryLatest
+              // Both registry lookups failed (#1047): nothing can be pinned,
+              // so pnpm resolves the dist-tag itself. That is a working
+              // install on a degraded registry, not a failure — but the
+              // version that lands was chosen by pnpm, not verified here, and
+              // the user is told so once instead of never.
+              if (expectedNpmVersion === null) {
+                versionUnverified = true
+                logEvent('warn', 'update', `${name}: registry metadata unavailable; installing ${name}@${tag} unpinned — the resolved version is unverified (#1047)`)
+              }
               // Never let `@latest` walk a profile BACKWARDS (#64 by @ZeroOrigin64):
               // a package whose latest dist-tag was left on an older release turns
               // this update into a downgrade that also rewrites an exact pin to
@@ -5728,6 +5739,11 @@ sendJson(response, 200, { updates })
               failureCode: versionFailureCode ?? result.refusalCode ?? undefined,
               renamedTo: renamedTo ?? undefined,
               removedDeclaration: removedDeclaration ?? undefined,
+              // #1047: no version could be pinned, so this is the one pnpm
+              // chose. The client marks the row `warned` rather than `done`
+              // and names the version, because "installed" and "installed
+              // something we verified" are not the same answer.
+              ...(versionUnverified ? { versionUnverified: { installed: readInstalledVersion(config.profile, name, activeProfileDir) } } : {}),
               ...(droppedBundles.length > 0 ? { droppedBundles } : {}),
               // Last, so the specific ones above keep the floor they had: this
               // only fills the case where every named branch said nothing and

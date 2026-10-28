@@ -2390,6 +2390,27 @@ describe('update flow — no npm publishing required', () => {
     })
   }
 
+  it('says the version was not verified when both registry lookups fail (#1047)', async () => {
+    // Reported as a silent fallback: `@latest` is sent unpinned, pnpm picks
+    // the release, and nothing in the answer says the version in hand was
+    // never checked here. It is still a working install on a degraded
+    // registry — so the row keeps its success mark and gains one sentence.
+    fake.npm['dsh-loop'].latest = '1.2.0'
+    fake.npm['dsh-loop'].versions['1.2.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    vi.stubGlobal('fetch', (url: string) => {
+      const u = String(url)
+      if (u.includes('registry.npmjs.org')) return Promise.resolve(new Response('rate limited', { status: 429 }))
+      return Promise.reject(new Error(`unexpected fetch: ${u}`))
+    })
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(200)
+    expect(r.json.ok).toBe(true)
+    // The version pnpm chose, so the client can name it rather than hedging.
+    expect(r.json.versionUnverified).toEqual({ installed: '1.2.0' })
+  })
+
   it('leaves a bystander with its bundle row after a failed update restores nothing (#1040)', async () => {
     // The rollback rewrites the manifest through pnpm and the plugin command,
     // neither of which carries rows it did not own. A bystander kept its

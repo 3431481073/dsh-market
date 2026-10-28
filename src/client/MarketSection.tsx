@@ -4118,7 +4118,22 @@ export function MarketSection(props: MarketSectionProps) {
           return
         }
         if (status === 200 && body.ok) {
-          setRecords(list => patchRecord(list, updateRecordId, { state: 'done' }))
+          // The install worked, but no version could be pinned (#1047): both
+          // registry lookups failed and pnpm chose the release itself. The ✓
+          // stays, because the plugin IS on disk and usable; the note names
+          // what actually arrived so the user can check it against what the
+          // card now shows.
+          const unverified = body.versionUnverified !== null && typeof body.versionUnverified === 'object'
+            ? body.versionUnverified as { installed?: unknown }
+            : null
+          setRecords(list => patchRecord(list, updateRecordId, unverified === null
+            ? { state: 'done' }
+            : {
+                state: 'warned',
+                reason: typeof unverified.installed === 'string' && unverified.installed !== ''
+                  ? t('versionUnverifiedNote').replace('{0}', unverified.installed)
+                  : t('versionUnverifiedNoteUnknown'),
+              }))
           setUpdatedNames(names => names.concat(name))
           // #558: the restart banner counts plugins the host parked behind a
           // restart, not every completed change. A client-only plugin comes
