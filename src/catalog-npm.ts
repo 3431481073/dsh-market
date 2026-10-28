@@ -20,6 +20,7 @@
  */
 
 import { gunzipSync } from 'node:zlib'
+import { fetchBodyWhileProgressing } from './body-progress.ts'
 import { marketFetch } from './net.ts'
 
 /** Long enough for a multi-megabyte tarball on a slow link, short enough to fall back. */
@@ -112,9 +113,16 @@ export async function catalogFromPackage(
   // Follow `dist.tarball` rather than composing a URL. A mirror rewrites
   // this field to its own host, and composing one would send the download
   // back to the origin registry the region exists to avoid.
-  const tarRes = await marketFetch(tarball, { signal: AbortSignal.timeout(TIMEOUT_MS) })
-  if (!tarRes.ok) throw new Error(`HTTP ${String(tarRes.status)} reading ${pkg} tarball`)
-  const bytes = fileFromTarball(Buffer.from(await tarRes.arrayBuffer()), file)
+  //
+  // The body is read under a stall watchdog rather than a total budget
+  // (#1049). A 3.2 MB tarball needs 158 KB/s to clear a fixed 20s ceiling,
+  // and a China mirror jittering to 17–40 KB/s cannot: both attempts died at
+  // the ceiling while bytes were still arriving, and the catalog fell through
+  // to a source that took longer still. TIMEOUT_MS still bounds the wait for
+  // the response to start, the one thing a fixed timer is good at.
+  const bytes = fileFromTarball(Buffer.from(
+    await fetchBodyWhileProgressing(marketFetch, tarball, `${pkg} tarball`),
+  ), file)
   if (bytes === null) throw new Error(`${pkg}@${version} carries no ${file}`)
   return { version, data: JSON.parse(bytes.toString('utf8')) as unknown }
 }
