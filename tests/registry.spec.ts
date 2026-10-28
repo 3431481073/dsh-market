@@ -559,6 +559,36 @@ describe('marketFetch', () => {
     )
   })
 
+  it('tries straight through when a LOOPBACK proxy refuses the host (#1042)', async () => {
+    // The report: the Desktop host runs a proxy on 127.0.0.1 whose port
+    // changes every session, allows only its own list of hosts, and answers
+    // 403 to any CONNECT for the catalog's domain — while `curl` straight to
+    // the same URL worked. A proxy on loopback is on this machine, so the
+    // same request may simply be repeated without it.
+    process.env.https_proxy = 'http://127.0.0.1:50007'
+    undici.fetch
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
+
+    const res = await marketFetch('https://awesome-dsh-plugin.com/plugins.json')
+
+    expect(await res.text()).toBe('ok')
+    expect(undici.fetch).toHaveBeenCalledTimes(2)
+    expect((undici.fetch.mock.calls[1]?.[1] as { dispatcher?: unknown }).dispatcher).toEqual({ direct: true })
+  })
+
+  it('never goes around a proxy that is not on this machine', async () => {
+    // A proxy elsewhere was configured on purpose; repeating the request
+    // directly could put it outside the network that person is meant to be
+    // on. The failure has to be reported as it always was.
+    process.env.https_proxy = 'http://proxy.corp.example:8080'
+    undici.fetch.mockRejectedValueOnce(new TypeError('fetch failed'))
+
+    await expect(marketFetch('https://catalog.example/plugins.json')).rejects.toThrow('fetch failed')
+
+    expect(undici.fetch).toHaveBeenCalledTimes(1)
+  })
+
   it('uses its own dispatcher when no proxy is configured (#742)', async () => {
     // Node 22's global fetch shares a dispatcher symbol with undici 8. After
     // the host's first web_fetch import, that symbol points at a wrapper the

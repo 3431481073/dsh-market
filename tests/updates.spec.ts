@@ -289,6 +289,28 @@ describe('checkUpdates — fresh-release wait (#945)', () => {
     },
   )
 
+  it('follows a numeric .npmrc window instead of holding every update forever (#1048)', async () => {
+    // No workspace file, so the .npmrc key IS the window — the shape the
+    // reporter had (`minimum-release-age=0`). install.ts already reads this key
+    // as the profile's window; the listing must not call it unverifiable.
+    const dir = npmProfile()
+    writeFileSync(join(dir, '.npmrc'), 'minimum-release-age=0\n')
+    registry(hoursAgo(1))
+    const resolved = await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')
+    expect(resolved.reason).not.toBe('policy-unknown')
+    expect(resolved.candidate).toBe('1.1.0')
+    expect(resolved.heldUpdate).toBeUndefined()
+  })
+
+  it('still refuses a .npmrc window that is not a number', async () => {
+    // Accepted spellings have to be ones this plugin can reproduce; a value it
+    // cannot read stays unverifiable rather than guessed.
+    const dir = npmProfile()
+    writeFileSync(join(dir, '.npmrc'), 'minimum-release-age=soon\n')
+    registry(hoursAgo(48))
+    expect((await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')).reason).toBe('policy-unknown')
+  })
+
   it.each(['PNPM_CONFIG_MINIMUM_RELEASE_AGE_STRICT', 'npm_config_minimumReleaseAgeIgnoreMissingTime'])(
     'accepts native transitive environment policy %s and still requires top-level time (#991 approved)', async key => {
       const dir = npmProfile(1440)

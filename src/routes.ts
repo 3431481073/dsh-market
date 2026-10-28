@@ -33,7 +33,7 @@ import {
 } from './dsh-cli.ts'
 import { packageOfEntryName } from './entry-identity.ts'
 import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
-import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, shippedInsertedRowIds, type ProfileManifestSnapshot } from './profile.ts'
+import { addProfileBundle, bundleExpressionRowIds, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, shippedInsertedRowIds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
 import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
@@ -999,6 +999,11 @@ export function mountMarketRoutes(
     // flip: a package whose rows are ALL opt-in rows still has to be
     // switchable.
     const optOutRows = new Set(bundleOptOutRowIds(join(activeProfileDir, 'node_modules', name)))
+    // Rows the bundle decides itself, by expression (`disabled: !!js …`),
+    // are a third shape next to opt-in rows: the market can neither read
+    // nor overrule the condition, so enabling the package must leave them
+    // exactly as the bundle ships them (#1043).
+    const expressionRows = new Set(bundleExpressionRowIds(join(activeProfileDir, 'node_modules', name)))
     const decided = patchRows.filter(rowId => !optOutRows.has(rowId))
     /** Rows that can carry a USER decision about this package — see above. */
     const userRows = decided.length > 0 ? decided : patchRows
@@ -1084,9 +1089,14 @@ export function mountMarketRoutes(
       // block by appending `disabled: false`, which would switch them on as a
       // side effect of turning the package itself back on (#876) — except to
       // remove a block an earlier disable left on one, which is a cleanup and
-      // never a force-enable.
+      // never a force-enable. Expression-decided rows stay out for the same
+      // reason (#1043): their condition is evaluated by the host at compose
+      // time, and a literal `disabled: false` written above it force-opened
+      // a row the environment keeps off, which then held the package pending
+      // at activation — except, again, to clean a block an earlier disable
+      // left, which restores the expression's authority, never a forced on.
       const targets = enabled
-        ? patchRows.filter(rowId => !optOutRows.has(rowId) || prePatch.disables.includes(rowId))
+        ? patchRows.filter(rowId => (!optOutRows.has(rowId) && !expressionRows.has(rowId)) || prePatch.disables.includes(rowId))
         : patchRows
       const flipped: string[] = []
       for (const rowId of targets) {
@@ -4651,6 +4661,8 @@ sendJson(response, 200, { updates })
             const selfChannel = SELF_NAMES.has(name) ? activeChannel() : null
             const tag = selfChannel === null ? 'latest' : DIST_TAG[selfChannel]
             let expectedNpmVersion: string | null = null
+            /** The target could not be pinned because registry lookups failed (#1047). */
+            let versionUnverified = false
             let enforceMatureReleaseAge = false
             // Resolve the registry pin BEFORE building the add target (#496).
             // Desktop's install boundary otherwise fetches `latest` again to
@@ -4784,6 +4796,15 @@ sendJson(response, 200, { updates })
                 ? await fetchNpmLatest(name)
                 : await versionOnChannel(name, selfChannel, await fetchNpmLatest(name)))
               if (expectedNpmVersion === null) expectedNpmVersion = registryLatest
+              // Both registry lookups failed (#1047): nothing can be pinned,
+              // so pnpm resolves the dist-tag itself. That is a working
+              // install on a degraded registry, not a failure — but the
+              // version that lands was chosen by pnpm, not verified here, and
+              // the user is told so once instead of never.
+              if (expectedNpmVersion === null) {
+                versionUnverified = true
+                logEvent('warn', 'update', `${name}: registry metadata unavailable; installing ${name}@${tag} unpinned — the resolved version is unverified (#1047)`)
+              }
               // Never let `@latest` walk a profile BACKWARDS (#64 by @ZeroOrigin64):
               // a package whose latest dist-tag was left on an older release turns
               // this update into a downgrade that also rewrites an exact pin to
@@ -5718,6 +5739,11 @@ sendJson(response, 200, { updates })
               failureCode: versionFailureCode ?? result.refusalCode ?? undefined,
               renamedTo: renamedTo ?? undefined,
               removedDeclaration: removedDeclaration ?? undefined,
+              // #1047: no version could be pinned, so this is the one pnpm
+              // chose. The client marks the row `warned` rather than `done`
+              // and names the version, because "installed" and "installed
+              // something we verified" are not the same answer.
+              ...(versionUnverified ? { versionUnverified: { installed: readInstalledVersion(config.profile, name, activeProfileDir) } } : {}),
               ...(droppedBundles.length > 0 ? { droppedBundles } : {}),
               // Last, so the specific ones above keep the floor they had: this
               // only fills the case where every named branch said nothing and

@@ -316,10 +316,22 @@ function readReleaseAgeExclusions(dir: string, name: string): ReleaseAgePolicyRe
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') npmrc = ''
     else return unknown
   }
-  // Security settings in .npmrc may have independent precedence and spelling;
-  // never guess which value the official Desktop's pnpm will actually use.
+  // A plain numeric window is a spelling this plugin can follow: install.ts
+  // reads exactly this key (`minimum-release-age`, same spelling) from the same
+  // file (readReleaseAgeMinutesFromNpmrc), so the wait it implies is the wait
+  // this plugin already enforces. Calling it unverifiable instead held every
+  // update forever (#1048 — `.npmrc minimum-release-age=0`). The engine split
+  // behind that choice: pnpm 10.20.0 honours the key here and in the
+  // environment, 11.7.0 and 12.16.1 read the policy from pnpm-workspace.yaml
+  // only. Following the file value is therefore exact on the old engine and at
+  // worst an over-hold on the new ones.
+  const windowSetting = (key: string, value: string | undefined): boolean =>
+    (key === 'minimum-release-age' && /^\d+$/.test(value?.trim() ?? ''))
+    || nativeTransitiveSetting(key, value)
+  // Any other spelling may have independent precedence; never guess which value
+  // the official Desktop's pnpm will actually use.
   for (const setting of npmrc.matchAll(/^\s*(minimum[-_]?release[-_]?age[^\s=]*)\s*=([^\r\n]*)/gmi)) {
-    if (!nativeTransitiveSetting(setting[1]!, setting[2])) return unknown
+    if (!windowSetting(setting[1]!, setting[2])) return unknown
   }
   let doc: unknown
   try { doc = load(source, { schema: JSON_SCHEMA }) } catch { return unknown }
