@@ -64,39 +64,6 @@ export function drainableAgent(agent: unknown): DrainableAgent | null {
   }
 }
 
-/**
- * Whether drain mode can take the barrier on every agent the host reports
- * right now.
- *
- * One incompatible handle makes the whole request unsupported: a partially
- * drained inventory would claim some agents and mutate files under the rest.
- */
-export function agentDrainSupport(agents: AgentsServiceLike | undefined): {
-  supported: boolean
-  agents: DrainableAgent[]
-  incompatibleIds: string[]
-} {
-  if (agents === undefined) return { supported: false, agents: [], incompatibleIds: [] }
-  let listed: RunningAgentLike[]
-  try {
-    listed = agents.list()
-  } catch {
-    return { supported: false, agents: [], incompatibleIds: [] }
-  }
-  if (!Array.isArray(listed)) return { supported: false, agents: [], incompatibleIds: [] }
-  const agentsOut: DrainableAgent[] = []
-  const incompatibleIds: string[] = []
-  for (const entry of listed) {
-    const agent = drainableAgent(entry)
-    if (agent === null) {
-      incompatibleIds.push(agentIdOf(entry) ?? 'agent')
-      continue
-    }
-    if (!agentsOut.some(candidate => candidate.id === agent.id)) agentsOut.push(agent)
-  }
-  return { supported: incompatibleIds.length === 0, agents: agentsOut, incompatibleIds }
-}
-
 export type AgentsLookup = () => AgentsServiceLike | undefined
 
 /**

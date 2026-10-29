@@ -146,6 +146,8 @@ export interface DrainBeginRequest {
 export type DrainBeginResult =
   | { mode: 'inline'; operation: DrainOperationView; result: DrainExecutionResult }
   | { mode: 'deferred'; operation: DrainOperationView }
+  /** The operation ended before it could be deferred (cancel, lost inventory). */
+  | { mode: 'terminal'; operation: DrainOperationView; status: number; payload: unknown }
   | { mode: 'refused'; status: number; payload: unknown }
   | { mode: 'busy' }
   | { mode: 'unsupported'; reason: string; incompatibleIds: string[] }
@@ -160,11 +162,23 @@ export class DrainRefusal extends Error {
   }
 }
 
+/**
+ * The probe finished with a normal no-op (`skipped: "current"`). The route's
+ * existing answer is the correct result; there is no operation to defer.
+ */
+export class DrainNoop extends Error {
+  constructor(
+    readonly status: number,
+    readonly payload: unknown,
+  ) {
+    super('drain probe is a no-op')
+  }
+}
+
 interface Hold {
   id: string
   release: () => void
   settled: boolean
-  lost: boolean
 }
 
 interface Operation {
@@ -287,6 +301,29 @@ export class DrainCoordinator {
   }
 
   /**
+   * Final synchronous barrier for the executor.
+   *
+   * Called after the mutation lock is held and before the package command
+   * starts. It re-enumerates the live Agents and claims any idle one that the
+   * creation subscription missed, so an undelivered `agent/created` cannot let
+   * a turn start between the last wait and the file change.
+   */
+  assertHeld(): { ok: true } | { ok: false; reason: string; ids: string[] } {
+    const active = this.active
+    if (active === null || active.settled) return { ok: false, reason: 'no-active-operation', ids: [] }
+    if (active.cancelRequested) return { ok: false, reason: 'cancelled', ids: [] }
+    if (this.barrierBroken) return { ok: false, reason: 'barrier-broken', ids: [] }
+    const live = this.liveAgents()
+    if (live === null) return { ok: false, reason: 'agents-service-unavailable', ids: [] }
+    const unheld: string[] = []
+    for (const agent of live) {
+      if (!this.holds.has(agent.id) && !this.claim(agent)) unheld.push(agent.id)
+    }
+    if (unheld.length > 0) return { ok: false, reason: 'agent-active', ids: unheld }
+    return { ok: true }
+  }
+
+  /**
    * Whether this request may use drain mode.
    *
    * Re-evaluated per request: a host that gains an incompatible Agent handle
@@ -382,7 +419,12 @@ export class DrainCoordinator {
           this.releaseAll()
           this.finish(operation, 'cancelled', null, null)
         }
-        return { mode: 'deferred', operation: this.view(operation) }
+        return {
+          mode: 'terminal',
+          operation: this.view(operation),
+          status: 200,
+          payload: { ok: false, cancelled: true },
+        }
       }
       operation.state = 'draining'
       const current = this.liveAgents()
@@ -392,14 +434,20 @@ export class DrainCoordinator {
           code: 'AGENT_DRAIN_UNSUPPORTED',
           message: 'the host stopped offering a readable Agent inventory before the operation started',
         }, null)
-        return { mode: 'deferred', operation: this.view(operation) }
+        const view = this.view(operation)
+        return {
+          mode: 'terminal',
+          operation: view,
+          status: 500,
+          payload: { ok: false, error: view.failure?.message ?? 'the host stopped offering a readable Agent inventory' },
+        }
       }
       this.setWait(operation, current.filter(agent => !this.holds.has(agent.id)))
       this.notify(operation)
       void this.runDeferred(operation)
       return { mode: 'deferred', operation: this.view(operation) }
     } catch (error) {
-      if (error instanceof DrainRefusal) {
+      if (error instanceof DrainRefusal || error instanceof DrainNoop) {
         this.abandon(operation)
         return { mode: 'refused', status: error.status, payload: error.payload }
       }
@@ -665,7 +713,6 @@ export class DrainCoordinator {
     const hold: Hold = {
       id: agent.id,
       settled: false,
-      lost: false,
       release: () => {
         if (hold.settled) return
         hold.settled = true
@@ -682,7 +729,6 @@ export class DrainCoordinator {
       // or another maintenance task already owns the Agent; the caller waits.
       const running = agent.runMaintenance<void>(signal => {
         const onAbort = () => {
-          hold.lost = true
           hold.release()
           this.onHoldLost(hold)
         }
@@ -691,7 +737,6 @@ export class DrainCoordinator {
         return held
       })
       void running.catch(() => {
-        hold.lost = true
         hold.release()
         this.onHoldLost(hold)
       })

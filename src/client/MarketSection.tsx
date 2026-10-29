@@ -1975,6 +1975,24 @@ function blockedSessions(body: { runningAgents?: unknown }): string[] | undefine
 }
 
 /**
+ * Drop a Host-projected row before the page's own record adopts the same
+ * operation id (#411).
+ *
+ * The status poll can create `host-<id>` while a slow probe is still running;
+ * without this the 202 would leave both rows pointing at one Host operation,
+ * and the panel's first match would keep the synthetic one forever.
+ */
+function withoutHostProjection(
+  list: readonly OperationRecord[],
+  operationId: string,
+  keepId: string,
+): OperationRecord[] {
+  return list.filter(record =>
+    record.id === keepId
+    || (record.id !== `host-${operationId}` && record.hostOperationId !== operationId))
+}
+
+/**
  * Whether the "compatible with this host" filter starts on, and remembers the
  * answer once the user disagrees with the default (#872).
  *
@@ -2949,6 +2967,8 @@ export function MarketSection(props: MarketSectionProps) {
    */
   const settledHostRef = useRef(new Set<string>())
   const knownHostIdsRef = useRef(new Set<string>())
+  /** Host operations the user cleared; a status poll must not add them back. */
+  const dismissedHostRef = useRef(new Set<string>())
   const drainMarkerRestoredRef = useRef(false)
 
   const clearDrainMarker = useCallback((operationId: string) => {
@@ -2988,15 +3008,19 @@ export function MarketSection(props: MarketSectionProps) {
     let saved: unknown = null
     try { saved = JSON.parse(localStorage.getItem('dshm-drain-v1') ?? 'null') } catch { saved = null }
     if (!Array.isArray(saved) || saved.length === 0) return
-    const stale = saved.filter((entry): entry is { id: string; kind?: unknown; name?: unknown; url?: unknown } => {
+    const entries = saved.filter((entry): entry is { id: string; kind?: unknown; name?: unknown; url?: unknown } => {
       if (entry === null || typeof entry !== 'object') return false
-      const id = (entry as { id?: unknown }).id
-      return typeof id === 'string' && !id.startsWith(`${boot}-`)
+      return typeof (entry as { id?: unknown }).id === 'string'
     })
+    const stale = entries.filter(entry => !entry.id.startsWith(`${boot}-`))
+    // Same-boot markers stay: the Host record reconstructs an active one, and
+    // a later Host restart still needs the marker to say the task was cut off.
+    const current = entries.filter(entry => entry.id.startsWith(`${boot}-`))
     if (stale.length > 0) {
       setRecords(previous => {
         let next = previous
         for (const entry of stale) {
+          if (dismissedHostRef.current.has(entry.id)) continue
           if (next.some(record => record.hostOperationId === entry.id || record.id === `host-${entry.id}`)) continue
           const kind = entry.kind === 'install' || entry.kind === 'update' || entry.kind === 'uninstall'
             ? entry.kind : 'update'
@@ -3015,7 +3039,10 @@ export function MarketSection(props: MarketSectionProps) {
       })
       setOperationsOpen(true)
     }
-    try { localStorage.removeItem('dshm-drain-v1') } catch { /* storage unavailable */ }
+    try {
+      if (current.length > 0) localStorage.setItem('dshm-drain-v1', JSON.stringify(current))
+      else localStorage.removeItem('dshm-drain-v1')
+    } catch { /* storage unavailable */ }
   }, [t])
 
   /** Project Host-owned operations into the Tasks panel. */
@@ -3040,6 +3067,7 @@ export function MarketSection(props: MarketSectionProps) {
     }
 
     for (const operation of operations) {
+      if (dismissedHostRef.current.has(operation.operationId)) continue
       if (operation.state !== 'succeeded' && operation.state !== 'failed' && operation.state !== 'cancelled') continue
       clearDrainMarker(operation.operationId)
       if (settledHostRef.current.has(operation.operationId)) continue
@@ -3111,6 +3139,7 @@ export function MarketSection(props: MarketSectionProps) {
     setRecords(previous => {
       let next = previous
       for (const operation of operations) {
+        if (dismissedHostRef.current.has(operation.operationId)) continue
         const existing = next.find(record => record.hostOperationId === operation.operationId)
         const desired = hostRecord(operation)
         if (existing === undefined) {
@@ -3121,18 +3150,28 @@ export function MarketSection(props: MarketSectionProps) {
         }
       }
       for (const entry of history) {
+        if (dismissedHostRef.current.has(entry.id)) continue
         const id = `host-${entry.id}`
-        if (next.some(record => record.id === id || record.hostOperationId === entry.id)) continue
-        if (entry.state === 'succeeded') {
-          next = enqueue(next, { id, kind: entry.kind, name: entry.name, hostOperationId: entry.id, state: 'done' })
+        // A row projected while the operation was active must settle from the
+        // journal, not stay queued forever because it already existed.
+        const existing = next.find(record => record.id === id || record.hostOperationId === entry.id)
+        const changes = entry.state === 'succeeded'
+          ? { state: 'done' as const, needsRefresh: false, blockedBy: undefined, waitSince: undefined, reason: undefined }
+          : {
+              state: entry.state === 'cancelled' ? 'warned' as const : 'failed' as const,
+              reason: entry.state === 'cancelled' ? t('agentDrainHistoryCancelled') : t('agentDrainHistoryFailedShort'),
+              blockedBy: undefined,
+              waitSince: undefined,
+            }
+        if (existing !== undefined) {
+          next = patchRecord(next, existing.id, changes)
         } else {
           next = enqueue(next, {
             id,
             kind: entry.kind,
             name: entry.name,
             hostOperationId: entry.id,
-            state: entry.state === 'cancelled' ? 'warned' : 'failed',
-            reason: entry.state === 'cancelled' ? t('agentDrainHistoryCancelled') : t('agentDrainHistoryFailedShort'),
+            ...changes,
           })
         }
       }
@@ -3888,7 +3927,7 @@ export function MarketSection(props: MarketSectionProps) {
         sessionStorage.removeItem('dshm-pending')
         if (status === 202 && typeof body.operationId === 'string') {
           const operation = body.operation as DrainOperationWire | undefined
-          setRecords(list => patchRecord(list, recordId, {
+          setRecords(list => patchRecord(withoutHostProjection(list, body.operationId, recordId), recordId, {
             state: 'queued',
             hostOperationId: body.operationId,
             ...(operation?.wait === null || operation?.wait === undefined
@@ -3987,6 +4026,16 @@ export function MarketSection(props: MarketSectionProps) {
             }
           }
           if (status === 409) {
+            if (body.failureCode === 'AGENT_BARRIER_LOST') {
+              // An Agent resumed before the Host could start the file change.
+              // Nothing changed; retrying is a new decision, not a queue item.
+              setRecords(list => patchRecord(list, recordId, {
+                state: 'failed',
+                reason: String(body.error ?? t('installFail')),
+              }))
+              setOperationsOpen(true)
+              return
+            }
             if (body.targetChanged === true) {
               // The Host refused before accepting the drain: the release it
               // would have installed changed while the confirmation sat.
@@ -4366,7 +4415,7 @@ export function MarketSection(props: MarketSectionProps) {
         setUpdatingName(null)
         if (status === 202 && typeof body.operationId === 'string') {
           const operation = body.operation as DrainOperationWire | undefined
-          setRecords(list => patchRecord(list, updateRecordId, {
+          setRecords(list => patchRecord(withoutHostProjection(list, body.operationId, updateRecordId), updateRecordId, {
             state: 'queued',
             hostOperationId: body.operationId,
             ...(operation?.wait === null || operation?.wait === undefined
@@ -4445,6 +4494,14 @@ export function MarketSection(props: MarketSectionProps) {
             return
           }
           if (status === 409) {
+            if (body.failureCode === 'AGENT_BARRIER_LOST') {
+              setRecords(list => patchRecord(list, updateRecordId, {
+                state: 'failed',
+                reason: String(body.error ?? 'An Agent became active before the update; nothing was changed.'),
+              }))
+              setOperationsOpen(true)
+              return
+            }
             if (body.targetChanged === true) {
               setRecords(list => patchRecord(list, updateRecordId, {
                 state: 'failed',
@@ -4988,7 +5045,7 @@ export function MarketSection(props: MarketSectionProps) {
       .then(({ status, body }) => {
         if (status === 202 && typeof body.operationId === 'string') {
           const operation = body.operation as DrainOperationWire | undefined
-          setRecords(list => patchRecord(list, uninstallRecordId, {
+          setRecords(list => patchRecord(withoutHostProjection(list, body.operationId, uninstallRecordId), uninstallRecordId, {
             state: 'queued',
             hostOperationId: body.operationId,
             ...(operation?.wait === null || operation?.wait === undefined
@@ -5007,6 +5064,14 @@ export function MarketSection(props: MarketSectionProps) {
           // retry once on the ordinary reject path (FR-9).
           setRecords(list => drop(list, uninstallRecordId))
           void doUninstall(name, confirmAgentsRunning, true)
+          return
+        }
+        if (status === 409 && body.failureCode === 'AGENT_BARRIER_LOST') {
+          setRecords(list => patchRecord(list, uninstallRecordId, {
+            state: 'failed',
+            reason: String(body.error ?? 'An Agent became active before the uninstall; nothing was changed.'),
+          }))
+          setOperationsOpen(true)
           return
         }
         if (status === 409 && body.targetChanged === true) {
@@ -6835,9 +6900,20 @@ export function MarketSection(props: MarketSectionProps) {
             onOpenChange={setOperationsOpen}
             replacing={replacing}
             envReady={envReady}
-            onClearSettled={() => setRecords(list => clearSettled(list))}
+            onClearSettled={() => {
+              for (const record of recordsRef.current) {
+                if (record.hostOperationId !== undefined
+                  && (record.state === 'done' || record.state === 'warned' || record.state === 'failed')) {
+                  dismissedHostRef.current.add(record.hostOperationId)
+                }
+              }
+              setRecords(list => clearSettled(list))
+            }}
             onCancel={record => doCancel(record)}
-            onDismiss={record => setRecords(list => drop(list, record.id))}
+            onDismiss={record => {
+              if (record.hostOperationId !== undefined) dismissedHostRef.current.add(record.hostOperationId)
+              setRecords(list => drop(list, record.id))
+            }}
             onRefresh={() => location.reload()}
             onResolveConflict={resolveConflict}
             onForceInstall={(record) => {

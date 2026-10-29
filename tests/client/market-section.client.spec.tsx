@@ -9520,6 +9520,173 @@ describe('Agent-safe drain mode (#411)', () => {
     expect(localStorage.getItem('dshm-drain-v1')).toBeNull()
   })
 
+  it('replaces a Host-projected row when the page own 202 arrives', async () => {
+    const operation = {
+      operationId: 'boot-1-drain-6',
+      kind: 'install',
+      name: 'dsh-loop',
+      url: 'https://github.com/alice/dsh-loop',
+      state: 'draining',
+      createdAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+      wait: { reason: 'agents', activeCount: 1, activeAgentIds: ['main'], since: Date.now() },
+      failure: null,
+      outcome: null,
+    }
+    stubFetch({
+      '/dsh-market/status': {
+        active: false,
+        pnpm: true,
+        boot: 'boot-1',
+        restart: true,
+        installed: {},
+        agentDrain: true,
+        drainActive: true,
+        drainOperations: [operation],
+        drainHistory: [],
+      },
+      '/dsh-market/install': {
+        __status: 202,
+        ok: true,
+        accepted: true,
+        operationId: operation.operationId,
+        operation,
+      },
+    })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText(/Waiting for 1 Agent/)).toBeTruthy()
+    fireEvent.click(screen.getAllByRole('button', { name: en.install })[0]!)
+    fireEvent.click(await screen.findByRole('button', { name: en.confirmInstall }))
+    await waitFor(() => {
+      // One Host operation, one row: the synthetic projection is dropped when
+      // the page's own record adopts the same id.
+      expect(screen.getAllByText(/Waiting for 1 Agent/)).toHaveLength(1)
+    })
+  })
+
+  it('settles a projected Host row from the terminal journal after a restart', async () => {
+    const operationId = 'boot-1-drain-7'
+    const status: Record<string, unknown> = {
+      active: false,
+      pnpm: true,
+      boot: 'boot-1',
+      restart: true,
+      installed: {},
+      agentDrain: true,
+      drainActive: true,
+      drainOperations: [{
+        operationId,
+        kind: 'update',
+        name: 'dsh-loop',
+        state: 'draining',
+        createdAt: Date.now(),
+        startedAt: null,
+        finishedAt: null,
+        wait: { reason: 'agents', activeCount: 1, activeAgentIds: ['main'], since: Date.now() },
+        failure: null,
+        outcome: null,
+      }],
+      drainHistory: [],
+    }
+    stubFetch({ '/dsh-market/status': status })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText(/Waiting for 1 Agent/)).toBeTruthy()
+
+    status.boot = 'boot-2'
+    status.drainActive = false
+    status.drainOperations = []
+    status.drainHistory = [{
+      at: Date.now(),
+      id: operationId,
+      kind: 'update',
+      name: 'dsh-loop',
+      state: 'succeeded',
+      agentsAtStart: 1,
+      agentsAtEnd: 0,
+    }]
+    await waitFor(() => expect(screen.queryByText(/Waiting for 1 Agent/)).toBeNull(), { timeout: 3500 })
+    expect(screen.getAllByText(en.opDone).length).toBeGreaterThan(0)
+  })
+
+  it('does not re-add a Host task the user cleared', async () => {
+    const activeId = 'boot-1-drain-8'
+    const doneId = 'boot-1-drain-9'
+    stubFetch({
+      '/dsh-market/status': {
+        active: false,
+        pnpm: true,
+        boot: 'boot-1',
+        restart: true,
+        installed: {},
+        agentDrain: true,
+        drainActive: true,
+        drainOperations: [
+          {
+            operationId: activeId,
+            kind: 'update',
+            name: 'dsh-loop',
+            state: 'draining',
+            createdAt: Date.now(),
+            startedAt: null,
+            finishedAt: null,
+            wait: { reason: 'agents', activeCount: 1, activeAgentIds: ['main'], since: Date.now() },
+            failure: null,
+            outcome: null,
+          },
+          {
+            operationId: doneId,
+            kind: 'update',
+            name: 'dsh-other',
+            state: 'succeeded',
+            createdAt: Date.now() - 1000,
+            startedAt: Date.now() - 900,
+            finishedAt: Date.now() - 500,
+            wait: null,
+            failure: null,
+            outcome: { needsRefresh: false, restartRequired: false, activation: null, hot: false },
+          },
+        ],
+        drainHistory: [],
+      },
+    })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText(/Waiting for 1 Agent/)).toBeTruthy()
+    expect(screen.getByText('dsh-other')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: en.opClear }))
+    await waitFor(() => expect(screen.queryByText('dsh-other')).toBeNull())
+
+    // The active row keeps the status poll alive; the cleared terminal row
+    // must not be projected back by it.
+    await new Promise(resolve => setTimeout(resolve, 2200))
+    expect(screen.queryByText('dsh-other')).toBeNull()
+  })
+
+  it('keeps a same-boot drain marker and only drops the stale one', async () => {
+    localStorage.setItem('dshm-drain-v1', JSON.stringify([
+      { id: 'boot-1-drain-10', kind: 'update', name: 'same-boot' },
+      { id: 'boot-old-drain-11', kind: 'update', name: 'old-boot' },
+    ]))
+    stubFetch({
+      '/dsh-market/status': {
+        active: false,
+        pnpm: true,
+        boot: 'boot-1',
+        restart: true,
+        installed: {},
+        agentDrain: true,
+        drainActive: false,
+        drainOperations: [],
+        drainHistory: [],
+      },
+    })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText(en.agentDrainRestarted)).toBeTruthy()
+    expect(JSON.parse(localStorage.getItem('dshm-drain-v1') ?? '[]')).toEqual([
+      { id: 'boot-1-drain-10', kind: 'update', name: 'same-boot' },
+    ])
+  })
+
   it('renders a cancelled Host task without the failure treatment', async () => {
     stubFetch({
       '/dsh-market/status': {

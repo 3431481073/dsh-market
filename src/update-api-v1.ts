@@ -111,6 +111,9 @@ const FORWARDED_FAILURE_CODES = new Set([
   // finish or forget it on the next start (#928, #949): an external caller
   // must be able to tell this from an ordinary failure.
   'update-incomplete',
+  // An Agent became active between the final drain check and the mutation
+  // lock; nothing was changed, and the caller may retry.
+  'AGENT_BARRIER_LOST',
 ])
 
 function failureCode(status: number, body: Record<string, unknown>): string {
@@ -137,6 +140,7 @@ function failureOf(status: number, body: Record<string, unknown>): UpdateFailure
     code,
     message: message.slice(-1200),
     retryable: code === 'AGENTS_RUNNING'
+      || code === 'AGENT_BARRIER_LOST'
       || code === 'TARGET_CHANGED'
       || code === 'OPERATION_BUSY'
       || code === 'RELEASE_TOO_FRESH'

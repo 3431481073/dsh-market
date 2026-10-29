@@ -9616,6 +9616,17 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			return names.length === 0 ? void 0 : names;
 		}
 		/**
+		* Drop a Host-projected row before the page's own record adopts the same
+		* operation id (#411).
+		*
+		* The status poll can create `host-<id>` while a slow probe is still running;
+		* without this the 202 would leave both rows pointing at one Host operation,
+		* and the panel's first match would keep the synthetic one forever.
+		*/
+		function withoutHostProjection(list, operationId, keepId) {
+			return list.filter((record) => record.id === keepId || record.id !== `host-${operationId}` && record.hostOperationId !== operationId);
+		}
+		/**
 		* Whether the "compatible with this host" filter starts on, and remembers the
 		* answer once the user disagrees with the default (#872).
 		*
@@ -10525,6 +10536,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			*/
 			const settledHostRef = (0, react.useRef)(/* @__PURE__ */ new Set());
 			const knownHostIdsRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+			/** Host operations the user cleared; a status poll must not add them back. */
+			const dismissedHostRef = (0, react.useRef)(/* @__PURE__ */ new Set());
 			const drainMarkerRestoredRef = (0, react.useRef)(false);
 			const clearDrainMarker = (0, react.useCallback)((operationId) => {
 				try {
@@ -10565,15 +10578,17 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					saved = null;
 				}
 				if (!Array.isArray(saved) || saved.length === 0) return;
-				const stale = saved.filter((entry) => {
+				const entries = saved.filter((entry) => {
 					if (entry === null || typeof entry !== "object") return false;
-					const id = entry.id;
-					return typeof id === "string" && !id.startsWith(`${boot}-`);
+					return typeof entry.id === "string";
 				});
+				const stale = entries.filter((entry) => !entry.id.startsWith(`${boot}-`));
+				const current = entries.filter((entry) => entry.id.startsWith(`${boot}-`));
 				if (stale.length > 0) {
 					setRecords((previous) => {
 						let next = previous;
 						for (const entry of stale) {
+							if (dismissedHostRef.current.has(entry.id)) continue;
 							if (next.some((record) => record.hostOperationId === entry.id || record.id === `host-${entry.id}`)) continue;
 							const kind = entry.kind === "install" || entry.kind === "update" || entry.kind === "uninstall" ? entry.kind : "update";
 							next = enqueue(next, {
@@ -10591,7 +10606,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					setOperationsOpen(true);
 				}
 				try {
-					localStorage.removeItem("dshm-drain-v1");
+					if (current.length > 0) localStorage.setItem("dshm-drain-v1", JSON.stringify(current));
+					else localStorage.removeItem("dshm-drain-v1");
 				} catch {}
 			}, [t]);
 			/** Project Host-owned operations into the Tasks panel. */
@@ -10607,6 +10623,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					}
 				}
 				for (const operation of operations) {
+					if (dismissedHostRef.current.has(operation.operationId)) continue;
 					if (operation.state !== "succeeded" && operation.state !== "failed" && operation.state !== "cancelled") continue;
 					clearDrainMarker(operation.operationId);
 					if (settledHostRef.current.has(operation.operationId)) continue;
@@ -10676,6 +10693,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				setRecords((previous) => {
 					let next = previous;
 					for (const operation of operations) {
+						if (dismissedHostRef.current.has(operation.operationId)) continue;
 						const existing = next.find((record) => record.hostOperationId === operation.operationId);
 						const desired = hostRecord(operation);
 						if (existing === void 0) next = enqueue(next, desired);
@@ -10685,22 +10703,28 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						}
 					}
 					for (const entry of history) {
+						if (dismissedHostRef.current.has(entry.id)) continue;
 						const id = `host-${entry.id}`;
-						if (next.some((record) => record.id === id || record.hostOperationId === entry.id)) continue;
-						if (entry.state === "succeeded") next = enqueue(next, {
-							id,
-							kind: entry.kind,
-							name: entry.name,
-							hostOperationId: entry.id,
-							state: "done"
-						});
+						const existing = next.find((record) => record.id === id || record.hostOperationId === entry.id);
+						const changes = entry.state === "succeeded" ? {
+							state: "done",
+							needsRefresh: false,
+							blockedBy: void 0,
+							waitSince: void 0,
+							reason: void 0
+						} : {
+							state: entry.state === "cancelled" ? "warned" : "failed",
+							reason: entry.state === "cancelled" ? t("agentDrainHistoryCancelled") : t("agentDrainHistoryFailedShort"),
+							blockedBy: void 0,
+							waitSince: void 0
+						};
+						if (existing !== void 0) next = patch(next, existing.id, changes);
 						else next = enqueue(next, {
 							id,
 							kind: entry.kind,
 							name: entry.name,
 							hostOperationId: entry.id,
-							state: entry.state === "cancelled" ? "warned" : "failed",
-							reason: entry.state === "cancelled" ? t("agentDrainHistoryCancelled") : t("agentDrainHistoryFailedShort")
+							...changes
 						});
 					}
 					return next;
@@ -11431,7 +11455,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					sessionStorage.removeItem("dshm-pending");
 					if (status === 202 && typeof body.operationId === "string") {
 						const operation = body.operation;
-						setRecords((list) => patch(list, recordId, {
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, recordId), recordId, {
 							state: "queued",
 							hostOperationId: body.operationId,
 							...operation?.wait === null || operation?.wait === void 0 ? {} : {
@@ -11512,6 +11536,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							}
 						}
 						if (status === 409) {
+							if (body.failureCode === "AGENT_BARRIER_LOST") {
+								setRecords((list) => patch(list, recordId, {
+									state: "failed",
+									reason: String(body.error ?? t("installFail"))
+								}));
+								setOperationsOpen(true);
+								return;
+							}
 							if (body.targetChanged === true) {
 								setRecords((list) => patch(list, recordId, {
 									state: "failed",
@@ -11846,7 +11878,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					setUpdatingName(null);
 					if (status === 202 && typeof body.operationId === "string") {
 						const operation = body.operation;
-						setRecords((list) => patch(list, updateRecordId, {
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, updateRecordId), updateRecordId, {
 							state: "queued",
 							hostOperationId: body.operationId,
 							...operation?.wait === null || operation?.wait === void 0 ? {} : {
@@ -11905,6 +11937,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							return;
 						}
 						if (status === 409) {
+							if (body.failureCode === "AGENT_BARRIER_LOST") {
+								setRecords((list) => patch(list, updateRecordId, {
+									state: "failed",
+									reason: String(body.error ?? "An Agent became active before the update; nothing was changed.")
+								}));
+								setOperationsOpen(true);
+								return;
+							}
 							if (body.targetChanged === true) {
 								setRecords((list) => patch(list, updateRecordId, {
 									state: "failed",
@@ -12454,7 +12494,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}))).then(({ status, body }) => {
 					if (status === 202 && typeof body.operationId === "string") {
 						const operation = body.operation;
-						setRecords((list) => patch(list, uninstallRecordId, {
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, uninstallRecordId), uninstallRecordId, {
 							state: "queued",
 							hostOperationId: body.operationId,
 							...operation?.wait === null || operation?.wait === void 0 ? {} : {
@@ -12474,6 +12514,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					if (body.unsupported === true) {
 						setRecords((list) => drop(list, uninstallRecordId));
 						doUninstall(name, confirmAgentsRunning, true);
+						return;
+					}
+					if (status === 409 && body.failureCode === "AGENT_BARRIER_LOST") {
+						setRecords((list) => patch(list, uninstallRecordId, {
+							state: "failed",
+							reason: String(body.error ?? "An Agent became active before the uninstall; nothing was changed.")
+						}));
+						setOperationsOpen(true);
 						return;
 					}
 					if (status === 409 && body.targetChanged === true) {
@@ -14382,9 +14430,15 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 										onOpenChange: setOperationsOpen,
 										replacing,
 										envReady,
-										onClearSettled: () => setRecords((list) => clearSettled(list)),
+										onClearSettled: () => {
+											for (const record of recordsRef.current) if (record.hostOperationId !== void 0 && (record.state === "done" || record.state === "warned" || record.state === "failed")) dismissedHostRef.current.add(record.hostOperationId);
+											setRecords((list) => clearSettled(list));
+										},
 										onCancel: (record) => doCancel(record),
-										onDismiss: (record) => setRecords((list) => drop(list, record.id)),
+										onDismiss: (record) => {
+											if (record.hostOperationId !== void 0) dismissedHostRef.current.add(record.hostOperationId);
+											setRecords((list) => drop(list, record.id));
+										},
 										onRefresh: () => location.reload(),
 										onResolveConflict: resolveConflict,
 										onForceInstall: (record) => {

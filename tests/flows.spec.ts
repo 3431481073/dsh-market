@@ -1715,6 +1715,25 @@ describe('install flow', () => {
       expect(readManifestAt(fake.profileDir).dependencies?.['dsh-prebuilt']).toBe('github:o/dsh-prebuilt')
     })
 
+    it('keeps the GitHub-source fallback on an inline drain install (#411)', async () => {
+      fake.tarballWithoutIntegrity = true
+      fake.repos['github:o/dsh-prebuilt'] = { name: 'dsh-prebuilt', manifest: archivePackage.manifest, artifacts: ['index.js'] }
+      // An empty inventory is still a drain-capable Host: no Agent is running,
+      // so the request runs inline and must behave like an ordinary install.
+      const drainBed = createTestbed({}, undefined, agentsService([]))
+      try {
+        const r = await drainBed.dispatch('POST', '/dsh-market/install', {
+          url: 'https://github.com/o/dsh-prebuilt',
+          busyPolicy: 'drain',
+        })
+        expect(r.status, JSON.stringify(r.json)).toBe(200)
+        expect(r.json.ok).toBe(true)
+        expect(installedSpec('dsh-prebuilt')).toBe('github:o/dsh-prebuilt')
+        expect(fake.calls.filter(call => call[0] === 'add').map(call => call[call.length - 1]))
+          .toEqual([TARBALL, 'github:o/dsh-prebuilt'])
+      } finally { drainBed.dispose() }
+    })
+
     it('does not retry a different failure from the archive — that one keeps its own diagnosis', async () => {
       fake.tarballs[TARBALL] = archivePackage
       fake.tarballFailsWith = 'ERR_PNPM_FETCH_404  GET https://github.com/o/dsh-prebuilt/releases/download/v1.0.0/dsh-prebuilt.tgz: Not Found - 404'
@@ -9946,6 +9965,34 @@ describe('Agent-safe drain mode (#411)', () => {
     } finally { drainBed.dispose() }
   })
 
+  it('waits for an Agent that appears only in the inventory, without a creation event', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const main = new FakeAgent('main', 'running')
+    const agents = [main]
+    const drainBed = createTestbed({}, undefined, agentsService(agents))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      const operationId = String(accepted.json.operationId)
+
+      const late = new FakeAgent('late', 'running')
+      // Deliberately no `drainBed.emit('agent/created', ...)`: the service
+      // list is the only source, like a host whose event dispatch is missing.
+      agents.push(late)
+      main.finishTurn()
+      const callsBefore = fake.calls.length
+      await new Promise(resolve => setTimeout(resolve, 40))
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+      expect(fake.calls.length).toBe(callsBefore)
+
+      late.finishTurn()
+      const completed = await settled(drainBed, operationId)
+      expect(completed.state).toBe('succeeded')
+      expect(installedSpec('dsh-loop')).toBe('^1.2.0')
+    } finally { drainBed.dispose() }
+  })
+
   it('keeps one mutation lane while a deferred operation waits', async () => {
     await seedInstalledLoop()
     advanceLatest('1.2.0')
@@ -10045,6 +10092,84 @@ describe('Agent-safe drain mode (#411)', () => {
       const completed = await settled(drainBed, String(accepted.json.operationId))
       expect(completed.state).toBe('succeeded')
       expect(installedSpec('dsh-loop')).toBeUndefined()
+    } finally { drainBed.dispose() }
+  })
+
+  it('keeps /status busy while the intent probe is still running', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    let releaseProbe!: () => void
+    const gate = new Promise<void>(resolve => { releaseProbe = resolve })
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('registry.npmjs.org')) {
+        await gate
+        return new Response(JSON.stringify({ version: '1.2.0' }), { status: 200 })
+      }
+      return new Response('{}', { status: 200 })
+    })
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const pending = drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const status = await drainBed.dispatch('GET', '/dsh-market/status')
+        expect(status.json.busy).toBe(true)
+        expect(status.json.active).toBe(false)
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      releaseProbe()
+      const accepted = await pending
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+    } finally { drainBed.dispose() }
+  })
+
+  it('returns the ordinary no-op result for a drain update that is already current', async () => {
+    await seedInstalledLoop()
+    const noopBed = createTestbed({}, undefined, agentsService([]))
+    try {
+      const response = await noopBed.dispatch('POST', '/dsh-market/api/v1/updates', {
+        packageName: 'dsh-loop',
+        busyPolicy: 'drain',
+      })
+      expect(response.status).toBe(200)
+      expect(response.json).toMatchObject({ ok: true, skipped: 'current' })
+      expect(response.json.failure).toBeUndefined()
+      expect(response.json.operation).toBeUndefined()
+    } finally { noopBed.dispose() }
+  })
+
+  it('does not answer 202 when a cancel lands during a slow probe', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    let releaseProbe!: () => void
+    const gate = new Promise<void>(resolve => { releaseProbe = resolve })
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('registry.npmjs.org')) {
+        await gate
+        return new Response(JSON.stringify({ version: '1.2.0' }), { status: 200 })
+      }
+      return new Response('{}', { status: 200 })
+    })
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const pending = drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      let operationId = ''
+      for (let attempt = 0; attempt < 100 && operationId === ''; attempt += 1) {
+        const status = await drainBed.dispatch('GET', '/dsh-market/status')
+        const operation = (status.json.drainOperations as Array<Record<string, unknown>> | undefined)
+          ?.find(entry => entry.name === 'dsh-loop')
+        if (operation !== undefined) operationId = String(operation.operationId)
+        else await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      expect(operationId).not.toBe('')
+      const cancelled = await drainBed.dispatch('POST', '/dsh-market/cancel', { operationId })
+      expect(cancelled.status).toBe(200)
+      releaseProbe()
+      const response = await pending
+      expect(response.status).not.toBe(202)
+      expect(response.json).toMatchObject({ ok: false, cancelled: true })
     } finally { drainBed.dispose() }
   })
 

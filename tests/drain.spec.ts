@@ -224,7 +224,11 @@ describe('DrainCoordinator', () => {
 
     resolveIntent({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } })
     const result = await pending
-    expect(result.mode).toBe('deferred')
+    expect(result.mode).toBe('terminal')
+    if (result.mode === 'terminal') {
+      expect(result.status).toBe(200)
+      expect(result.payload).toMatchObject({ ok: false, cancelled: true })
+    }
     coordinator.dispose()
   })
 
@@ -381,6 +385,43 @@ describe('DrainCoordinator', () => {
     expect(agent.maintenanceCalls).toBe(1)
     expect(agent.cancelCalls).toBe(0)
     bed.coordinator.dispose()
+  })
+
+  it('asserts every live Agent is held when the executor asks for the lock', async () => {
+    const host = new FakeHost()
+    const coordinator = new DrainCoordinator({
+      host,
+      journal: { append: () => {} },
+      bootId: 'boot-test',
+      log: () => {},
+    })
+    const main = new FakeAgent('main')
+    host.create(main)
+    let resolveIntent!: (intent: DrainIntent) => void
+    const pending = coordinator.begin({
+      kind: 'update',
+      name: 'dsh-loop',
+      forceDeferred: true,
+      captureIntent: () => new Promise(resolve => { resolveIntent = resolve }),
+      execute: async () => OK,
+    })
+    await Promise.resolve()
+    expect(coordinator.assertHeld()).toEqual({ ok: true })
+
+    const late = new FakeAgent('late', 'running')
+    host.create(late)
+    expect(coordinator.assertHeld()).toMatchObject({ ok: false, reason: 'agent-active', ids: ['late'] })
+    host.remove(late)
+    expect(coordinator.assertHeld()).toEqual({ ok: true })
+
+    const list = host.list.bind(host)
+    host.list = () => { throw new Error('agent registry disposed') }
+    expect(coordinator.assertHeld()).toMatchObject({ ok: false, reason: 'agents-service-unavailable' })
+    host.list = list
+
+    coordinator.dispose()
+    resolveIntent({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } })
+    await pending
   })
 
   it('reports unsupported when an Inventory handle lacks the maintenance boundary', async () => {
