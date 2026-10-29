@@ -10706,7 +10706,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						if (dismissedHostRef.current.has(entry.id)) continue;
 						const id = `host-${entry.id}`;
 						const existing = next.find((record) => record.id === id || record.hostOperationId === entry.id);
-						const changes = entry.state === "succeeded" ? {
+						const changes = entry.state === "succeeded" ? existing?.needsRefresh === true ? {
+							state: "done",
+							blockedBy: void 0,
+							waitSince: void 0,
+							reason: void 0
+						} : {
 							state: "done",
 							needsRefresh: false,
 							blockedBy: void 0,

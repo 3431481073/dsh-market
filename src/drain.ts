@@ -98,6 +98,18 @@ export interface DrainExecutionResult {
   payload: unknown
 }
 
+/** Why the executor may not touch the profile right now. */
+export type DrainMutationReason =
+  | 'market-unloaded'
+  | 'cancelled'
+  | 'barrier-broken'
+  | 'agents-service-unavailable'
+  | 'agent-active'
+
+export type DrainMutationGate =
+  | { ok: true }
+  | { ok: false; reason: DrainMutationReason; ids: string[] }
+
 export interface DrainJournalRecord {
   at: number
   id: string
@@ -301,17 +313,23 @@ export class DrainCoordinator {
   }
 
   /**
-   * Final synchronous barrier for the executor.
+   * Whether the executor may still change files right now.
    *
-   * Called after the mutation lock is held and before the package command
-   * starts. It re-enumerates the live Agents and claims any idle one that the
-   * creation subscription missed, so an undelivered `agent/created` cannot let
-   * a turn start between the last wait and the file change.
+   * Called under the mutation lock at the route entrance and again
+   * immediately before every package command. The second call is the
+   * load-bearing one: the validation between the two can take seconds on the
+   * network, during which an Agent can become active, the user can cancel, or
+   * the market can unload. It also re-enumerates live Agents and claims any
+   * idle one that the creation subscription missed, so an undelivered
+   * `agent/created` cannot let a turn start between the last wait and the file
+   * change.
    */
-  assertHeld(): { ok: true } | { ok: false; reason: string; ids: string[] } {
+  assertCanMutate(): DrainMutationGate {
+    if (this.disposeRequested) return { ok: false, reason: 'market-unloaded', ids: [] }
     const active = this.active
-    if (active === null || active.settled) return { ok: false, reason: 'no-active-operation', ids: [] }
-    if (active.cancelRequested) return { ok: false, reason: 'cancelled', ids: [] }
+    if (active === null || active.settled || active.cancelRequested) {
+      return { ok: false, reason: 'cancelled', ids: [] }
+    }
     if (this.barrierBroken) return { ok: false, reason: 'barrier-broken', ids: [] }
     const live = this.liveAgents()
     if (live === null) return { ok: false, reason: 'agents-service-unavailable', ids: [] }
@@ -402,10 +420,10 @@ export class DrainCoordinator {
         return await this.runInline(operation)
       }
 
-      // From here on the operation can be waited on, so it belongs in the
-      // Host record even while the intent probe is still running: a cancel
-      // during that window must be visible and must write a terminal record.
-      operation.exposed = true
+      // The probe may still be refused (`TARGET_CHANGED`, no-op, unsupported
+      // host). Do not expose the operation until it is actually deferred:
+      // publishing it now would leave the client with a Host row that the
+      // Host then deletes, which the client has no event to clean up.
       operation.state = 'accepted'
       this.setWait(operation, unheld)
       const intent = await request.captureIntent()
@@ -511,11 +529,22 @@ export class DrainCoordinator {
     if (this.disposeRequested) return
     this.disposeRequested = true
     const active = this.active
-    // Only a package command that is actually running belongs to this market.
-    // Unloading while a drain request is merely waiting must not kill an
-    // unrelated operation that happened to hold the shared cancel handle.
-    if (active !== null && !active.settled && (active.state === 'running' || active.state === 'verifying')) {
+    const executing = active !== null && !active.settled
+      && (active.state === 'running' || active.state === 'verifying')
+    const detach = (): void => {
+      for (const dispose of this.subscriptions.splice(0)) {
+        try { dispose() } catch { /* host already tore the subscription down */ }
+      }
+      this.notifyActivity()
+    }
+    if (executing) {
+      // The executor is already inside a package command. Stop that command,
+      // stop any later runPlugin through the pre-command gate, and leave the
+      // holds and the Agent subscription in place until the drain loop's
+      // finally runs: releasing or detaching now would leave a live command
+      // changing files with nobody watching the Agents.
       this.abortMutation?.()
+      return
     }
     if (active !== null && !active.settled) {
       this.finish(active, 'cancelled', {
@@ -524,6 +553,11 @@ export class DrainCoordinator {
       }, null)
     }
     this.releaseAll()
+    detach()
+  }
+
+  /** Detach the host subscriptions once; safe to call more than once. */
+  private detach(): void {
     for (const dispose of this.subscriptions.splice(0)) {
       try { dispose() } catch { /* host already tore the subscription down */ }
     }
@@ -549,12 +583,30 @@ export class DrainCoordinator {
       }
     } finally {
       this.releaseAll()
+      if (this.disposeRequested) this.detach()
     }
-    if (this.barrierBroken) {
+    if (this.disposeRequested) {
+      result = {
+        status: 503,
+        payload: {
+          ok: false,
+          failureCode: 'MARKET_UNLOADED',
+          error: 'the market was unloaded before this operation finished',
+        },
+      }
+      this.finish(operation, 'cancelled', {
+        code: 'MARKET_UNLOADED',
+        message: 'the market was unloaded before this operation finished',
+      }, null)
+    } else if (operation.cancelRequested) {
+      result = { status: 200, payload: { ok: false, cancelled: true } }
+      this.finish(operation, 'cancelled', null, null)
+    } else if (this.barrierBroken) {
       result = {
         status: 500,
         payload: {
           ok: false,
+          failureCode: 'AGENT_BARRIER_LOST',
           error: 'an Agent could not be held at the maintenance boundary; verify the installed files before retrying',
         },
       }
@@ -639,6 +691,20 @@ export class DrainCoordinator {
       operation.startedAt = this.now()
       this.notify(operation)
       const result = await operation.execute(operation.intent, operation.onPhase)
+      // The executor can return success after a cancel or unload landed too
+      // late for its last gate. The Host's state wins: the user asked to stop
+      // or the market is gone, so this is not reported as a completed change.
+      if (this.disposeRequested) {
+        this.finish(operation, 'cancelled', {
+          code: 'MARKET_UNLOADED',
+          message: 'the market was unloaded before this operation finished',
+        }, null)
+        return
+      }
+      if (operation.cancelRequested) {
+        this.finish(operation, 'cancelled', null, null)
+        return
+      }
       if (this.barrierBroken) {
         this.finish(operation, 'failed', {
           code: 'AGENT_BARRIER_LOST',
@@ -658,8 +724,16 @@ export class DrainCoordinator {
     } finally {
       this.releaseAll()
       if (!operation.settled) {
-        this.finish(operation, 'failed', { code: 'DRAIN_FAILED', message: 'the drain coordinator stopped unexpectedly' }, null)
+        if (this.disposeRequested) {
+          this.finish(operation, 'cancelled', {
+            code: 'MARKET_UNLOADED',
+            message: 'the market was unloaded before this operation finished',
+          }, null)
+        } else {
+          this.finish(operation, 'failed', { code: 'DRAIN_FAILED', message: 'the drain coordinator stopped unexpectedly' }, null)
+        }
       }
+      if (this.disposeRequested) this.detach()
     }
   }
 

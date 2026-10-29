@@ -199,28 +199,33 @@ describe('DrainCoordinator', () => {
       abortMutation: () => true,
     })
     const agent = new FakeAgent('main')
+    // A running Agent forces the deferred path; the idle one is held by the
+    // same synchronous claim, which is what a cancel during the probe must
+    // release.
+    const runner = new FakeAgent('runner', 'running')
     host.create(agent)
+    host.create(runner)
     let resolveIntent!: (intent: DrainIntent) => void
     const pending = coordinator.begin({
       kind: 'update',
       name: 'dsh-loop',
-      forceDeferred: true,
       captureIntent: () => new Promise(resolve => { resolveIntent = resolve }),
       execute: async () => OK,
     })
     // `begin` claimed the idle Agent synchronously and is waiting on the probe.
+    // The operation is deliberately not exposed yet: a probe that is refused
+    // must not leave a Host row the client cannot clean up.
     await Promise.resolve()
     expect(agent.held).toBe(true)
-    const view = coordinator.list()[0]
-    expect(view).toMatchObject({ state: 'accepted' })
-    if (view === undefined) return
+    expect(coordinator.list()).toEqual([])
+    const operationId = 'boot-test-drain-1'
 
-    expect(coordinator.cancel(view.operationId)).toBe(true)
+    expect(coordinator.cancel(operationId)).toBe(true)
     await Promise.resolve()
     expect(agent.held).toBe(false)
     expect(() => agent.startTurn()).not.toThrow()
-    expect(records.at(-1)).toMatchObject({ id: view.operationId, state: 'cancelled' })
-    expect(coordinator.get(view.operationId)?.state).toBe('cancelled')
+    expect(records).toEqual([])
+    expect(coordinator.get(operationId)).toBeNull()
 
     resolveIntent({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } })
     const result = await pending
@@ -387,7 +392,7 @@ describe('DrainCoordinator', () => {
     bed.coordinator.dispose()
   })
 
-  it('asserts every live Agent is held when the executor asks for the lock', async () => {
+  it('asserts every live Agent is held and the operation still live before a mutation', async () => {
     const host = new FakeHost()
     const coordinator = new DrainCoordinator({
       host,
@@ -406,22 +411,26 @@ describe('DrainCoordinator', () => {
       execute: async () => OK,
     })
     await Promise.resolve()
-    expect(coordinator.assertHeld()).toEqual({ ok: true })
+    expect(coordinator.assertCanMutate()).toEqual({ ok: true })
 
     const late = new FakeAgent('late', 'running')
     host.create(late)
-    expect(coordinator.assertHeld()).toMatchObject({ ok: false, reason: 'agent-active', ids: ['late'] })
+    expect(coordinator.assertCanMutate()).toMatchObject({ ok: false, reason: 'agent-active', ids: ['late'] })
     host.remove(late)
-    expect(coordinator.assertHeld()).toEqual({ ok: true })
+    expect(coordinator.assertCanMutate()).toEqual({ ok: true })
 
     const list = host.list.bind(host)
     host.list = () => { throw new Error('agent registry disposed') }
-    expect(coordinator.assertHeld()).toMatchObject({ ok: false, reason: 'agents-service-unavailable' })
+    expect(coordinator.assertCanMutate()).toMatchObject({ ok: false, reason: 'agents-service-unavailable' })
     host.list = list
 
-    coordinator.dispose()
+    expect(coordinator.cancel('boot-test-drain-1')).toBe(true)
+    expect(coordinator.assertCanMutate()).toMatchObject({ ok: false, reason: 'cancelled' })
     resolveIntent({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } })
     await pending
+
+    coordinator.dispose()
+    expect(coordinator.assertCanMutate()).toMatchObject({ ok: false, reason: 'market-unloaded' })
   })
 
   it('reports unsupported when an Inventory handle lacks the maintenance boundary', async () => {
@@ -446,6 +455,32 @@ describe('DrainCoordinator', () => {
     if (result.mode !== 'inline') return
     expect(result.result.status).toBe(200)
     bed.coordinator.dispose()
+  })
+
+  it('keeps holds through a dispose mid-execution and settles MARKET_UNLOADED', async () => {
+    const bed = harness()
+    const agent = new FakeAgent('main', 'running')
+    bed.host.create(agent)
+    let release!: (result: DrainExecutionResult) => void
+    const result = await bed.begin(async () => await new Promise(resolve => { release = resolve }))
+    expect(result.mode).toBe('deferred')
+    if (result.mode !== 'deferred') return
+    agent.finishTurn()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(agent.held).toBe(true)
+
+    bed.coordinator.dispose()
+    // The command is still live: releasing now would leave nobody holding the
+    // Agent while pnpm changes files.
+    expect(agent.held).toBe(true)
+    expect(bed.coordinator.assertCanMutate()).toMatchObject({ ok: false, reason: 'market-unloaded' })
+
+    release({ status: 200, payload: { ok: true } })
+    const settled = await bed.coordinator.whenSettled(result.operation.operationId)
+    expect(settled?.state).toBe('cancelled')
+    expect(settled?.failure?.code).toBe('MARKET_UNLOADED')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(agent.held).toBe(false)
   })
 
   it('does not abort an unrelated package command when unloaded with no active operation', () => {

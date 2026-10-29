@@ -9687,6 +9687,68 @@ describe('Agent-safe drain mode (#411)', () => {
     ])
   })
 
+  it('keeps the refresh action when the terminal journal settles a done row', async () => {
+    const activeId = 'boot-1-drain-12'
+    const doneId = 'boot-1-drain-13'
+    const status: Record<string, unknown> = {
+      active: false,
+      pnpm: true,
+      boot: 'boot-1',
+      restart: true,
+      installed: {},
+      agentDrain: true,
+      drainActive: true,
+      drainOperations: [
+        {
+          operationId: activeId,
+          kind: 'update',
+          name: 'dsh-loop',
+          state: 'draining',
+          createdAt: Date.now(),
+          startedAt: null,
+          finishedAt: null,
+          wait: { reason: 'agents', activeCount: 1, activeAgentIds: ['main'], since: Date.now() },
+          failure: null,
+          outcome: null,
+        },
+        {
+          operationId: doneId,
+          kind: 'install',
+          name: 'dsh-other',
+          url: 'https://github.com/alice/dsh-other',
+          state: 'succeeded',
+          createdAt: Date.now() - 1000,
+          startedAt: Date.now() - 900,
+          finishedAt: Date.now() - 500,
+          wait: null,
+          failure: null,
+          outcome: { needsRefresh: true, restartRequired: false, activation: 'live', hot: false },
+        },
+      ],
+      drainHistory: [],
+    }
+    stubFetch({ '/dsh-market/status': status })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByText(/Waiting for 1 Agent/)).toBeTruthy()
+    expect(screen.getAllByRole('button', { name: en.refresh }).length).toBeGreaterThan(0)
+
+    // The live operation is gone; only the journal describes what happened.
+    status.drainOperations = [(status.drainOperations as unknown[])[0]]
+    status.drainHistory = [{
+      at: Date.now(),
+      id: doneId,
+      kind: 'install',
+      name: 'dsh-other',
+      state: 'succeeded',
+      agentsAtStart: 1,
+      agentsAtEnd: 0,
+    }]
+    await new Promise(resolve => setTimeout(resolve, 2200))
+    // The journal has no activation outcome; it must not overwrite the one the
+    // live operation already reported.
+    expect(screen.getAllByRole('button', { name: en.refresh }).length).toBeGreaterThan(0)
+  })
+
   it('renders a cancelled Host task without the failure treatment', async () => {
     stubFetch({
       '/dsh-market/status': {

@@ -36,7 +36,7 @@ import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
 import { addProfileBundle, bundleExpressionRowIds, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, shippedInsertedRowIds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
-import { DrainCoordinator, DrainNoop, DrainRefusal, type DrainExecutionResult, type DrainIntent } from './drain.ts'
+import { DrainCoordinator, DrainNoop, DrainRefusal, type DrainExecutionResult, type DrainIntent, type DrainMutationGate } from './drain.ts'
 import { DrainJournal } from './drain-journal.ts'
 import { inProbe, runInProbe } from './probe-context.ts'
 import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
@@ -874,6 +874,45 @@ export function mountMarketRoutes(
     return await run
   }
 
+  /** Answer a drain gate that says the profile must not be touched. */
+  const sendDrainGate = (response: ServerResponse, gate: DrainMutationGate): void => {
+    if (gate.ok) return
+    if (gate.reason === 'cancelled') {
+      // The user's cancel wins even when the executor had already returned a
+      // success; the client treats `cancelled` as a quiet reset.
+      sendJson(response, 200, { ok: false, cancelled: true })
+      return
+    }
+    if (gate.reason === 'market-unloaded') {
+      sendJson(response, 503, {
+        ok: false,
+        failureCode: 'MARKET_UNLOADED',
+        error: '市场正在卸载，这次没有改任何文件。 / The market is unloading; nothing was changed.',
+      })
+      return
+    }
+    sendJson(response, 409, {
+      ok: false,
+      failureCode: 'AGENT_BARRIER_LOST',
+      ...(gate.ids.length === 0 ? {} : { runningAgents: gate.ids }),
+      error: '有 Agent 在文件变更前恢复了活动，这次没有改任何文件。 / An Agent became active before the file change; nothing was changed.',
+    })
+  }
+
+  /**
+   * The executor's pre-command gate: called immediately before every
+   * `runPlugin` in the three package routes, including retry and fallback
+   * paths. A drain replay that cannot still hold every Agent answers here
+   * instead of starting pnpm.
+   */
+  const assertDrainMutation = (request: IncomingMessage, response: ServerResponse): boolean => {
+    if (drainCallOf(request)?.role !== 'execute') return true
+    const gate = drainCoordinator.assertCanMutate()
+    if (gate.ok) return true
+    sendDrainGate(response, gate)
+    return false
+  }
+
   /**
    * Run a mutating operation under the shared mutation lock. `kind` selects
    * the UI busy flag (`install` = pnpm operation, `write` = direct profile
@@ -922,13 +961,9 @@ export function mountMarketRoutes(
       // can start, so an Agent created without a delivered event is either
       // claimed now or stops the operation with no file change.
       if (drainCall?.role === 'execute') {
-        const barrier = drainCoordinator.assertHeld()
-        if (!barrier.ok) {
-          sendJson(response, 409, {
-            failureCode: 'AGENT_BARRIER_LOST',
-            ...(barrier.ids.length === 0 ? {} : { runningAgents: barrier.ids }),
-            error: '有 Agent 在文件变更前恢复了活动，这次没有改任何文件。 / An Agent became active before the file change; nothing was changed.',
-          })
+        const gate = drainCoordinator.assertCanMutate()
+        if (!gate.ok) {
+          sendDrainGate(response, gate)
           return null
         }
       }
@@ -2189,6 +2224,23 @@ export function mountMarketRoutes(
   }
 
   /**
+   * Pin a GitHub shortcut to its current commit when the region has no proxy.
+   *
+   * `acceleratedTarget` deliberately leaves global installs to pnpm, but a
+   * deferred drain operation must name one immutable artifact. Without this, a
+   * bare `github:owner/repo` (and a `#path:` selector) could never satisfy the
+   * exact-target gate in the global region.
+   */
+  const pinDrainGithubTarget = async (target: string, region: Region): Promise<string> => {
+    if (githubCommitOfTarget(target) !== null) return target
+    const match = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/.exec(target)
+    if (match === null) return target
+    const sha = await resolveHeadCommit(match[1]!, region)
+    if (sha === null) return target
+    return githubTargetAtCommit(target, sha) ?? target
+  }
+
+  /**
    * Run the route's ordinary validation without mutating anything, and keep
    * the target it resolved. The probe body asks the agent guard to stand
    * aside: drain mode is exactly what is going to wait for those Agents.
@@ -2737,16 +2789,25 @@ export function mountMarketRoutes(
                 if (view.state === 'verifying') operationsV1.beginVerifying(operation.operationId)
                 if (view.state === 'succeeded' || view.state === 'failed' || view.state === 'cancelled') {
                   if (view.state === 'failed' && view.failure?.code === 'AGENT_BARRIER_LOST') {
-                    finishPublic(500, { ok: false, error: view.failure.message })
+                    finishPublic(409, {
+                      ok: false,
+                      failureCode: 'AGENT_BARRIER_LOST',
+                      error: view.failure.message,
+                    })
+                    return
+                  }
+                  if (view.state === 'cancelled') {
+                    // A cancel or unload that landed after the executor
+                    // returned success still owns the final state.
+                    finishPublic(200, { ok: false, cancelled: true })
                     return
                   }
                   if (finished) return
-                  if (view.state === 'cancelled') {
-                    finishPublic(200, { ok: false, cancelled: true })
-                  } else {
+                  {
                     finishPublic(500, {
                       ok: false,
                       error: view.failure?.message ?? 'the deferred update failed',
+                      ...(view.failure?.code === undefined ? {} : { failureCode: view.failure.code }),
                       ...(view.failure?.code === 'TARGET_CHANGED' ? { targetChanged: true } : {}),
                     })
                   }
@@ -4896,7 +4957,8 @@ sendJson(response, 200, { updates })
             busyPolicy?: unknown
           }
           const name = typeof body.name === 'string' ? body.name : ''
-          if (drainCallOf(request) === undefined && body.busyPolicy === 'drain') {
+          const drainCall = drainCallOf(request)
+          if (drainCall === undefined && body.busyPolicy === 'drain') {
             if (body.restore === true) {
               sendJson(response, 400, {
                 ok: false,
@@ -5308,13 +5370,16 @@ sendJson(response, 200, { updates })
             // `github:owner/repo` untouched, so passing a restore through it
             // still gets a China-region mirror where one applies and changes
             // nothing where one does not.
-            const target = restore
+            let target = restore
               ? (NPM_NAME_RE.test(spec) ? `${spec}@${tag}` : await acceleratedTarget(spec, region))
               : usesNpmUpdateTarget
                 ? (expectedNpmVersion !== null ? `${name}@${expectedNpmVersion}` : `${name}@${tag}`)
                 : genericGitTarget !== null
                   ? genericGitTarget
                   : await acceleratedTarget(gitSpec!, region)
+            if (drainCall !== undefined && (drainCall.role === 'probe' || drainCall.expected !== null)) {
+              target = await pinDrainGithubTarget(target, region)
+            }
             const repoIdentity = isGit ? repoOfTarget(spec) : null
             const repoKey = repoIdentity?.split('#')[0] ?? null
             // A non-GitHub remote (#632) has no repo key. Its identity is the
@@ -5389,7 +5454,6 @@ sendJson(response, 200, { updates })
             const addArgs = inPlaceUpdate
               ? (force ? ['update', RELEASE_AGE_OVERRIDE, name] : ['update', name])
               : (force && marketFlags && config.desktopHost !== true ? ['add', RELEASE_AGE_OVERRIDE, target] : ['add', target])
-            const drainCall = drainCallOf(request)
             if (drainCall !== undefined) {
               // Only a deferred operation needs an immutable target. An inline
               // drain runs now, with the ordinary route's tolerance for an
@@ -5598,6 +5662,7 @@ sendJson(response, 200, { updates })
             // Even when a candidate was mature during validation, pnpm may
             // reject the operation because another lockfile entry is young or
             // the registry changes. Never retry this update with an age bypass.
+            if (!assertDrainMutation(request, response)) return
             const result = await (enforceMatureReleaseAge ? runMaturePluginUpdate : runPlugin)(config.profile, addArgs)
             drainPhaseOf(request)?.('verifying')
             const cancelled = result.cancelled
@@ -7029,6 +7094,7 @@ sendJson(response, 200, { updates })
             // package that is no longer installed.
             const rowJournal = PendingRowJournal.forProfile(activeProfileDir)
             rowJournal.begin({ profile: config.profile, name, patchPath: userPatchPath, rows: ownedRows })
+            if (!assertDrainMutation(request, response)) return
             const result = await runPlugin(config.profile, ['remove', name])
             drainPhaseOf(request)?.('verifying')
             const cancelled = result.cancelled
@@ -7253,7 +7319,8 @@ sendJson(response, 200, { updates })
             version?: unknown
             busyPolicy?: unknown
           }
-          if (drainCallOf(request) === undefined && body.busyPolicy === 'drain') {
+          const drainCall = drainCallOf(request)
+          if (drainCall === undefined && body.busyPolicy === 'drain') {
             const requestedUrl = typeof body.url === 'string' ? body.url : ''
             await handleDrainRequest(
               response,
@@ -7321,6 +7388,12 @@ sendJson(response, 200, { updates })
             let target = await acceleratedTarget(pinnedTarget, region)
             if (target !== pinnedTarget) {
               logEvent('info', 'region', `${entry.name}: resolved HEAD through an available ${region} route; downloading the commit-pinned GitHub target directly for pnpm integrity`)
+            }
+            // The global region has no proxy, so `acceleratedTarget` leaves a
+            // bare `github:` shortcut to pnpm. A deferred drain operation
+            // still needs the commit it was approved against.
+            if (drainCall !== undefined && (drainCall.role === 'probe' || drainCall.expected !== null)) {
+              target = await pinDrainGithubTarget(target, region)
             }
             // Duplicate guard (#27): the same plugin listed under another name
             // (an alias entry pointing at the same repo) must never install
@@ -7430,7 +7503,6 @@ sendJson(response, 200, { updates })
             const beforeSpecs = readInstalled(config.profile, activeProfileDir)
             const before = new Set(Object.keys(beforeSpecs))
             if (retryAlias !== null) before.delete(retryAlias)
-            const drainCall = drainCallOf(request)
             if (drainCall !== undefined) {
               // Only a deferred operation needs an immutable target. The
               // inline path runs immediately, exactly like an ordinary
@@ -7486,6 +7558,7 @@ sendJson(response, 200, { updates })
             // the manifest and left the half for the next pnpm run to trip on.
             const lockfileBefore = captureProfileLockfile()
             const pinned = target === pinnedTarget && pinnedTarget !== plainTarget
+            if (!assertDrainMutation(request, response)) return
             let result = await (pinned ? runPluginKeepingReleaseAge : runPlugin)(config.profile, ['add', target])
             // Set when the profile's own minimumReleaseAge is what kept this
             // install off the newest release (#635). The install SUCCEEDS —
@@ -7533,6 +7606,7 @@ sendJson(response, 200, { updates })
                     : `${entry.name}: the profile's registry could not resolve ${String(registryLatest)} (a mirror behind the registry that answered latest) — retrying with the bare name`)
                 restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
                 if (bypass) {
+                  if (!assertDrainMutation(request, response)) return
                   result = await runPlugin(config.profile, ['add', RELEASE_AGE_OVERRIDE, pinnedTarget])
                 }
                 if (!bypass || result.exitCode !== 0 || result.timedOut || result.cancelled) {
@@ -7541,6 +7615,7 @@ sendJson(response, 200, { updates })
                   // name, which is the version pnpm admits.
                   if (heldBack) heldByAge = true
                   target = plainTarget
+                  if (!assertDrainMutation(request, response)) return
                   result = await runPlugin(config.profile, ['add', target])
                 }
               }
@@ -7569,6 +7644,7 @@ sendJson(response, 200, { updates })
                 restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
                 if (lockfileBefore.ok) restoreProfileLockfile(lockfileBefore.snapshot)
                 target = await acceleratedTarget(sourceTarget, region)
+                if (!assertDrainMutation(request, response)) return
                 result = await runPlugin(config.profile, ['add', target])
               }
             }
@@ -7595,6 +7671,7 @@ sendJson(response, 200, { updates })
               // Collection repos (e.g. skin monorepos) install as a junk
               // fileset with no root package.json; retarget to the real
               // plugin subdirectories via pnpm's #path: selector.
+              if (!assertDrainMutation(request, response)) return
               ok = await retargetCollections(runPlugin, config.profile, before, target, activeProfileDir)
             }
             // Fake-success guard (#18): a clean exit that added nothing
@@ -7608,6 +7685,7 @@ sendJson(response, 200, { updates })
             let removedBroken: string[] = []
             let conflicts: { name: string; id: string; owner: string }[] = []
             if ((result.exitCode === 0 || portCollisionLanded) && !cancelled) {
+              if (!assertDrainMutation(request, response)) return
               const validated = await validateAddedPlugins(runPlugin, config.profile, before, activeProfileDir)
               removedBroken = validated.removedBroken
               conflicts = validated.conflicts

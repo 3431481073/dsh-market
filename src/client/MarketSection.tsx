@@ -3156,7 +3156,12 @@ export function MarketSection(props: MarketSectionProps) {
         // journal, not stay queued forever because it already existed.
         const existing = next.find(record => record.id === id || record.hostOperationId === entry.id)
         const changes = entry.state === 'succeeded'
-          ? { state: 'done' as const, needsRefresh: false, blockedBy: undefined, waitSince: undefined, reason: undefined }
+          // The journal does not carry the activation outcome, but a row that
+          // already reported "refresh needed" must keep that report: this
+          // projection runs after the live operation, not instead of it.
+          ? (existing?.needsRefresh === true
+              ? { state: 'done' as const, blockedBy: undefined, waitSince: undefined, reason: undefined }
+              : { state: 'done' as const, needsRefresh: false, blockedBy: undefined, waitSince: undefined, reason: undefined })
           : {
               state: entry.state === 'cancelled' ? 'warned' as const : 'failed' as const,
               reason: entry.state === 'cancelled' ? t('agentDrainHistoryCancelled') : t('agentDrainHistoryFailedShort'),
