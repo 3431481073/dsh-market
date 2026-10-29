@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { DrainCoordinator, type DrainExecutionResult, type DrainIntent, type DrainJournalRecord } from '../src/drain.ts'
@@ -188,6 +188,46 @@ describe('DrainCoordinator', () => {
     bed.coordinator.dispose()
   })
 
+  it('releases holds and records a cancel while the intent probe is still running', async () => {
+    const host = new FakeHost()
+    const records: DrainJournalRecord[] = []
+    const coordinator = new DrainCoordinator({
+      host,
+      journal: { append: record => records.push(record) },
+      bootId: 'boot-test',
+      log: () => {},
+      abortMutation: () => true,
+    })
+    const agent = new FakeAgent('main')
+    host.create(agent)
+    let resolveIntent!: (intent: DrainIntent) => void
+    const pending = coordinator.begin({
+      kind: 'update',
+      name: 'dsh-loop',
+      forceDeferred: true,
+      captureIntent: () => new Promise(resolve => { resolveIntent = resolve }),
+      execute: async () => OK,
+    })
+    // `begin` claimed the idle Agent synchronously and is waiting on the probe.
+    await Promise.resolve()
+    expect(agent.held).toBe(true)
+    const view = coordinator.list()[0]
+    expect(view).toMatchObject({ state: 'accepted' })
+    if (view === undefined) return
+
+    expect(coordinator.cancel(view.operationId)).toBe(true)
+    await Promise.resolve()
+    expect(agent.held).toBe(false)
+    expect(() => agent.startTurn()).not.toThrow()
+    expect(records.at(-1)).toMatchObject({ id: view.operationId, state: 'cancelled' })
+    expect(coordinator.get(view.operationId)?.state).toBe('cancelled')
+
+    resolveIntent({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } })
+    const result = await pending
+    expect(result.mode).toBe('deferred')
+    coordinator.dispose()
+  })
+
   it('cancels before mutation without calling the executor and releases the hold', async () => {
     const bed = harness()
     const agent = new FakeAgent('main', 'running')
@@ -296,11 +336,96 @@ describe('DrainCoordinator', () => {
     bed.coordinator.dispose()
   })
 
+  it('refuses instead of mutating when the agent inventory becomes unreadable', async () => {
+    const host = new FakeHost()
+    let calls = 0
+    const list = host.list.bind(host)
+    host.list = () => {
+      calls += 1
+      if (calls > 1) throw new Error('agent registry disposed')
+      return list()
+    }
+    let executed = false
+    const coordinator = new DrainCoordinator({
+      host,
+      journal: { append: () => {} },
+      bootId: 'boot-test',
+      log: () => {},
+    })
+    const result = await coordinator.begin({
+      kind: 'update',
+      name: 'dsh-loop',
+      captureIntent: async () => ({ kind: 'update', name: 'dsh-loop', expected: { target: 'dsh-loop@1.2.0' } }),
+      execute: async () => {
+        executed = true
+        return OK
+      },
+    })
+    expect(result.mode).toBe('unsupported')
+    expect(executed).toBe(false)
+    coordinator.dispose()
+  })
+
+  it('retries a claim whose maintenance task started with an aborted signal', async () => {
+    const bed = harness({ forceDeferred: true })
+    const agent = new FakeAgent('main')
+    agent.startAbortedOnce = true
+    bed.host.create(agent)
+
+    const result = await bed.begin(async () => OK)
+    expect(result.mode).toBe('deferred')
+    if (result.mode !== 'deferred') return
+    const settled = await bed.coordinator.whenSettled(result.operation.operationId)
+    expect(settled?.state).toBe('succeeded')
+    // The aborted attempt never became a hold; the real claim did.
+    expect(agent.maintenanceCalls).toBe(1)
+    expect(agent.cancelCalls).toBe(0)
+    bed.coordinator.dispose()
+  })
+
   it('reports unsupported when an Inventory handle lacks the maintenance boundary', async () => {
     const bed = harness()
     bed.host.agents.push({ id: 'legacy', status: 'idle' } as never)
     const result = await bed.begin(async () => OK)
     expect(result.mode).toBe('unsupported')
+    bed.coordinator.dispose()
+  })
+
+  it('does not latch drain off for an incompatible Agent created outside an operation', async () => {
+    const bed = harness()
+    const legacy = { id: 'legacy', status: 'idle' }
+    bed.host.create(legacy as never)
+    expect(bed.coordinator.support().supported).toBe(false)
+    bed.host.remove(legacy as never)
+
+    const agent = new FakeAgent('main')
+    bed.host.create(agent)
+    const result = await bed.begin(async () => OK)
+    expect(result.mode).toBe('inline')
+    if (result.mode !== 'inline') return
+    expect(result.result.status).toBe(200)
+    bed.coordinator.dispose()
+  })
+
+  it('does not abort an unrelated package command when unloaded with no active operation', () => {
+    const bed = harness()
+    bed.coordinator.dispose()
+    expect(bed.aborted.count).toBe(0)
+  })
+
+  it('redacts home paths from a failed executor message', async () => {
+    const home = homedir()
+    const leaked = join(home, '.dsh', 'profiles', 'web')
+    const bed = harness()
+    const agent = new FakeAgent('main', 'running')
+    bed.host.create(agent)
+    const result = await bed.begin(async () => { throw new Error(`failed under ${leaked}`) })
+    expect(result.mode).toBe('deferred')
+    if (result.mode !== 'deferred') return
+    agent.finishTurn()
+    const settled = await bed.coordinator.whenSettled(result.operation.operationId)
+    expect(settled?.failure?.message).not.toContain(home)
+    expect(settled?.failure?.message).toContain('~')
     bed.coordinator.dispose()
   })
 
@@ -333,5 +458,24 @@ describe('DrainJournal', () => {
       { at: 1, id: 'boot-drain-1', kind: 'update', name: 'dsh-loop', state: 'succeeded', agentsAtStart: 2, agentsAtEnd: 0 },
       { at: 2, id: 'boot-drain-2', kind: 'uninstall', name: 'dsh-old', state: 'failed', agentsAtStart: 1, agentsAtEnd: 1 },
     ])
+  })
+
+  it('redacts home paths in the package name', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'drain-journal-'))
+    dirs.push(dir)
+    const file = join(dir, '.dsh-market', 'drain.ndjson')
+    const home = homedir()
+    const journal = new DrainJournal(file)
+    journal.append({
+      at: 1,
+      id: 'boot-drain-1',
+      kind: 'update',
+      name: `plugin at ${join(home, '.dsh', 'profiles', 'web')}`,
+      state: 'failed',
+      agentsAtStart: 0,
+      agentsAtEnd: 0,
+    })
+    expect(journal.recent()[0]?.name).not.toContain(home)
+    expect(journal.recent()[0]?.name).toContain('~')
   })
 })

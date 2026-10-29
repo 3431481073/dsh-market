@@ -13,6 +13,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { DrainJournalLike, DrainJournalRecord, DrainKind, DrainTerminalState } from './drain.ts'
+import { redactHomePaths } from './log-redaction.ts'
 
 const MAX_BYTES = 64 * 1024
 const MAX_RECORDS = 50
@@ -23,7 +24,7 @@ const STATES: ReadonlySet<DrainTerminalState> = new Set(['succeeded', 'failed', 
 
 function clean(value: unknown, max = TEXT_MAX): string | null {
   if (typeof value !== 'string') return null
-  const text = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+  const text = redactHomePaths(value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
   return text === '' ? null : text.slice(0, max)
 }
 

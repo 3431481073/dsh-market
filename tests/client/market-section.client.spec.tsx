@@ -9519,4 +9519,37 @@ describe('Agent-safe drain mode (#411)', () => {
     expect(await screen.findByText(en.agentDrainRestarted)).toBeTruthy()
     expect(localStorage.getItem('dshm-drain-v1')).toBeNull()
   })
+
+  it('renders a cancelled Host task without the failure treatment', async () => {
+    stubFetch({
+      '/dsh-market/status': {
+        active: false,
+        pnpm: true,
+        boot: 'boot-1',
+        restart: true,
+        installed: {},
+        agentDrain: true,
+        drainActive: false,
+        drainOperations: [{
+          operationId: 'boot-1-drain-3',
+          kind: 'update',
+          name: 'dsh-loop',
+          state: 'cancelled',
+          createdAt: Date.now(),
+          startedAt: null,
+          finishedAt: Date.now(),
+          wait: null,
+          failure: null,
+          outcome: null,
+        }],
+        drainHistory: [],
+      },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: en.opTitle }))
+    expect(await screen.findByText(en.agentDrainCancelled)).toBeTruthy()
+    // A cancelled task is not a failure; the generic retry action belongs to
+    // failed rows only.
+    expect(screen.queryByRole('button', { name: en.opRetry })).toBeNull()
+  })
 })

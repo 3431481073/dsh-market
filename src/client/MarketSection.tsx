@@ -3006,7 +3006,8 @@ export function MarketSection(props: MarketSectionProps) {
             name: typeof entry.name === 'string' ? entry.name : 'plugin',
             ...(typeof entry.url === 'string' ? { url: entry.url } : {}),
             hostOperationId: entry.id,
-            state: 'failed',
+            // A Host restart cancelled the task; it did not fail on its own.
+            state: 'warned',
             reason: t('agentDrainRestarted'),
           })
         }
@@ -3094,7 +3095,9 @@ export function MarketSection(props: MarketSectionProps) {
         }
       }
       if (operation.state === 'cancelled') {
-        return { ...base, state: 'failed', reason: t('agentDrainCancelled'), blockedBy: undefined, waitSince: undefined }
+        // Cancellation is not a failure (AGENTS.md): keep the row settled and
+        // readable without the red attention state.
+        return { ...base, state: 'warned', reason: t('agentDrainCancelled'), blockedBy: undefined, waitSince: undefined }
       }
       return {
         ...base,
@@ -3128,7 +3131,7 @@ export function MarketSection(props: MarketSectionProps) {
             kind: entry.kind,
             name: entry.name,
             hostOperationId: entry.id,
-            state: 'failed',
+            state: entry.state === 'cancelled' ? 'warned' : 'failed',
             reason: entry.state === 'cancelled' ? t('agentDrainHistoryCancelled') : t('agentDrainHistoryFailedShort'),
           })
         }

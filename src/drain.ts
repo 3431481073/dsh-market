@@ -343,28 +343,58 @@ export class DrainCoordinator {
     }
     const operation = this.createOperation(request)
     this.active = operation
+    this.barrierBroken = false
     try {
       // Claim every idle Agent synchronously. A failure here means that Agent
       // is mid-turn or another maintenance task owns it, and the deferred loop
-      // will wait for it instead of touching its files.
-      for (const agent of this.liveAgents()) this.claim(agent)
-      const unheld = this.liveAgents().filter(agent => !this.holds.has(agent.id))
+      // will wait for it instead of touching its files. An unreadable
+      // inventory is not an empty one: refuse rather than mutate unheld.
+      const live = this.liveAgents()
+      if (live === null) {
+        this.abandon(operation)
+        return { mode: 'unsupported', reason: 'agents-service-unavailable', incompatibleIds: [] }
+      }
+      for (const agent of live) this.claim(agent)
+      const afterClaims = this.liveAgents()
+      if (afterClaims === null) {
+        this.abandon(operation)
+        return { mode: 'unsupported', reason: 'agents-service-unavailable', incompatibleIds: [] }
+      }
+      const unheld = afterClaims.filter(agent => !this.holds.has(agent.id))
       if (unheld.length === 0 && request.forceDeferred !== true) {
         return await this.runInline(operation)
       }
 
+      // From here on the operation can be waited on, so it belongs in the
+      // Host record even while the intent probe is still running: a cancel
+      // during that window must be visible and must write a terminal record.
+      operation.exposed = true
       operation.state = 'accepted'
       this.setWait(operation, unheld)
       const intent = await request.captureIntent()
-      operation.intent = intent
-      operation.name = intent.name
-      if (intent.url !== undefined) operation.url = intent.url
+      if (!operation.settled) {
+        operation.intent = intent
+        operation.name = intent.name
+        if (intent.url !== undefined) operation.url = intent.url
+      }
       if (operation.cancelRequested || operation.settled || this.disposeRequested) {
-        if (!operation.settled) this.finish(operation, 'cancelled', null, null)
+        if (!operation.settled) {
+          this.releaseAll()
+          this.finish(operation, 'cancelled', null, null)
+        }
         return { mode: 'deferred', operation: this.view(operation) }
       }
       operation.state = 'draining'
-      this.setWait(operation, this.liveAgents().filter(agent => !this.holds.has(agent.id)))
+      const current = this.liveAgents()
+      if (current === null) {
+        this.releaseAll()
+        this.finish(operation, 'failed', {
+          code: 'AGENT_DRAIN_UNSUPPORTED',
+          message: 'the host stopped offering a readable Agent inventory before the operation started',
+        }, null)
+        return { mode: 'deferred', operation: this.view(operation) }
+      }
+      this.setWait(operation, current.filter(agent => !this.holds.has(agent.id)))
       this.notify(operation)
       void this.runDeferred(operation)
       return { mode: 'deferred', operation: this.view(operation) }
@@ -373,7 +403,8 @@ export class DrainCoordinator {
         this.abandon(operation)
         return { mode: 'refused', status: error.status, payload: error.payload }
       }
-      const message = error instanceof Error ? error.message : String(error)
+      const message = safeMessage(error instanceof Error ? error.message : String(error))
+        ?? 'the drain preflight failed'
       this.log('error', 'drain', `preflight failed before acceptance — ${message}`)
       this.abandon(operation)
       return { mode: 'refused', status: 500, payload: { ok: false, error: message } }
@@ -396,9 +427,13 @@ export class DrainCoordinator {
       return true
     }
     if (operation.state === 'accepted') {
-      // The intent probe may still be in flight; `begin` sees the flag after
-      // it returns and settles the operation without an executor.
-      if (operation.intent === null) return true
+      // The intent probe may still be in flight. Finish now and release the
+      // holds it already took; `begin` sees `settled` when the probe returns
+      // and only reports the terminal view. Waiting for the probe here would
+      // leave every claimed Agent parked for as long as it takes.
+      this.releaseAll()
+      this.finish(operation, 'cancelled', null, null)
+      return true
     }
     this.finish(operation, 'cancelled', null, null)
     this.releaseAll()
@@ -427,8 +462,13 @@ export class DrainCoordinator {
   dispose(): void {
     if (this.disposeRequested) return
     this.disposeRequested = true
-    this.abortMutation?.()
     const active = this.active
+    // Only a package command that is actually running belongs to this market.
+    // Unloading while a drain request is merely waiting must not kill an
+    // unrelated operation that happened to hold the shared cancel handle.
+    if (active !== null && !active.settled && (active.state === 'running' || active.state === 'verifying')) {
+      this.abortMutation?.()
+    }
     if (active !== null && !active.settled) {
       this.finish(active, 'cancelled', {
         code: 'MARKET_UNLOADED',
@@ -452,7 +492,13 @@ export class DrainCoordinator {
     try {
       result = await operation.execute(null, operation.onPhase)
     } catch (error) {
-      result = { status: 500, payload: { ok: false, error: error instanceof Error ? error.message : String(error) } }
+      result = {
+        status: 500,
+        payload: {
+          ok: false,
+          error: safeMessage(error instanceof Error ? error.message : String(error)) ?? 'the drain executor failed',
+        },
+      }
     } finally {
       this.releaseAll()
     }
@@ -508,13 +554,30 @@ export class DrainCoordinator {
         }
         // Final synchronous re-enumeration. The creation subscription claims a
         // new Agent before its first turn; if one still slipped in, go back to
-        // waiting instead of mutating under it.
+        // waiting instead of mutating under it. An unreadable inventory is a
+        // failure, not an empty list.
+        const live = this.liveAgents()
+        if (live === null) {
+          this.finish(operation, 'failed', {
+            code: 'AGENT_DRAIN_UNSUPPORTED',
+            message: 'the host stopped offering a readable Agent inventory before the operation started',
+          }, null)
+          return
+        }
         let allHeld = true
-        for (const agent of this.liveAgents()) {
+        for (const agent of live) {
           if (!this.holds.has(agent.id) && !this.claim(agent)) allHeld = false
         }
         if (this.barrierBroken) continue
-        if (!allHeld || this.liveAgents().some(agent => !this.holds.has(agent.id))) continue
+        const afterClaims = this.liveAgents()
+        if (afterClaims === null) {
+          this.finish(operation, 'failed', {
+            code: 'AGENT_DRAIN_UNSUPPORTED',
+            message: 'the host stopped offering a readable Agent inventory before the operation started',
+          }, null)
+          return
+        }
+        if (!allHeld || afterClaims.some(agent => !this.holds.has(agent.id))) continue
         break
       }
 
@@ -540,7 +603,8 @@ export class DrainCoordinator {
       if (!operation.settled) {
         this.finish(operation, 'failed', {
           code: 'DRAIN_FAILED',
-          message: error instanceof Error ? error.message : String(error),
+          message: safeMessage(error instanceof Error ? error.message : String(error))
+            ?? 'the drain coordinator failed',
         }, null)
       }
     } finally {
@@ -558,7 +622,9 @@ export class DrainCoordinator {
   private async drainAgents(operation: Operation): Promise<boolean> {
     operation.state = 'draining'
     while (!operation.cancelRequested && !this.disposeRequested && !this.barrierBroken) {
-      const unheld = this.liveAgents().filter(agent => !this.holds.has(agent.id))
+      const live = this.liveAgents()
+      if (live === null) return false
+      const unheld = live.filter(agent => !this.holds.has(agent.id))
       this.setWait(operation, unheld)
       if (unheld.length === 0) return true
       let claimed = 0
@@ -566,7 +632,9 @@ export class DrainCoordinator {
         if (operation.cancelRequested || this.disposeRequested) break
         if (this.claim(agent)) claimed += 1
       }
-      const remaining = this.liveAgents().filter(agent => !this.holds.has(agent.id))
+      const current = this.liveAgents()
+      if (current === null) return false
+      const remaining = current.filter(agent => !this.holds.has(agent.id))
       this.setWait(operation, remaining)
       if (remaining.length === 0) return true
       const waitingForTurn = remaining.some(agent => agent.status === 'running')
@@ -604,6 +672,11 @@ export class DrainCoordinator {
         releaseHeld()
       },
     }
+    // Record the hold BEFORE calling into the host: `runMaintenance` may
+    // invoke the task synchronously, and an already-aborted signal settles
+    // the hold before this function regains control. Setting it afterwards
+    // would leave a settled entry that later claims mistake for a real hold.
+    this.holds.set(agent.id, hold)
     try {
       // `runMaintenance` claims synchronously. A synchronous throw means a turn
       // or another maintenance task already owns the Agent; the caller waits.
@@ -623,9 +696,13 @@ export class DrainCoordinator {
         this.onHoldLost(hold)
       })
     } catch {
+      if (this.holds.get(agent.id) === hold) this.holds.delete(agent.id)
       return false
     }
-    this.holds.set(agent.id, hold)
+    if (hold.settled) {
+      if (this.holds.get(agent.id) === hold) this.holds.delete(agent.id)
+      return false
+    }
     return true
   }
 
@@ -654,10 +731,13 @@ export class DrainCoordinator {
   private onAgentCreated(agent: unknown): void {
     const drainable = drainableAgent(agent)
     if (drainable === null) {
-      this.barrierBroken = true
+      // An incompatible handle only matters while an operation owns the
+      // barrier. Outside an operation it must not latch drain off for the rest
+      // of the process: support() is re-evaluated per request.
       const active = this.active
-      if (active !== null && !active.settled && (active.state === 'running' || active.state === 'verifying')) {
-        this.abortMutation?.()
+      if (active !== null && !active.settled) {
+        this.barrierBroken = true
+        if (active.state === 'running' || active.state === 'verifying') this.abortMutation?.()
       }
       this.notifyActivity()
       return
@@ -705,7 +785,7 @@ export class DrainCoordinator {
       failure: null,
       outcome: null,
       intent: null,
-      initialAgents: this.liveAgents().length,
+      initialAgents: this.liveAgents()?.length ?? 0,
       exposed: request.forceDeferred === true,
       cancelRequested: false,
       settled: false,
@@ -776,7 +856,7 @@ export class DrainCoordinator {
           name: operation.name,
           state,
           agentsAtStart: operation.initialAgents,
-          agentsAtEnd: this.liveAgents().length,
+          agentsAtEnd: this.liveAgents()?.length ?? 0,
         })
       } catch (error) {
         this.log('warn', 'drain', `terminal record could not be persisted — ${error instanceof Error ? error.message : String(error)}`)
@@ -827,14 +907,20 @@ export class DrainCoordinator {
     this.notify(operation)
   }
 
-  private liveAgents(): DrainableAgent[] {
+  /**
+   * The live Agent handles, or null when the host's inventory is unreadable.
+   *
+   * Null is not an empty list: treating a half-disposed registry as "no
+   * Agents" would let a drain request mutate files without holding anything.
+   */
+  private liveAgents(): DrainableAgent[] | null {
     let listed: unknown[] | null
     try {
       listed = this.host.list()
     } catch {
-      return []
+      return null
     }
-    if (listed === null) return []
+    if (listed === null) return null
     const agents: DrainableAgent[] = []
     for (const entry of listed) {
       const agent = drainableAgent(entry)

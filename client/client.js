@@ -10582,7 +10582,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 								name: typeof entry.name === "string" ? entry.name : "plugin",
 								...typeof entry.url === "string" ? { url: entry.url } : {},
 								hostOperationId: entry.id,
-								state: "failed",
+								state: "warned",
 								reason: t("agentDrainRestarted")
 							});
 						}
@@ -10660,7 +10660,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					};
 					if (operation.state === "cancelled") return {
 						...base,
-						state: "failed",
+						state: "warned",
 						reason: t("agentDrainCancelled"),
 						blockedBy: void 0,
 						waitSince: void 0
@@ -10699,7 +10699,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							kind: entry.kind,
 							name: entry.name,
 							hostOperationId: entry.id,
-							state: "failed",
+							state: entry.state === "cancelled" ? "warned" : "failed",
 							reason: entry.state === "cancelled" ? t("agentDrainHistoryCancelled") : t("agentDrainHistoryFailedShort")
 						});
 					}

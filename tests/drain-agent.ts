@@ -13,6 +13,8 @@ export class FakeAgent {
   maintenanceCalls = 0
   cancelCalls = 0
   failClaims = 0
+  /** Emulate a host that invokes the maintenance task with an aborted signal. */
+  startAbortedOnce = false
   private maintenance: { controller: AbortController } | null = null
   private idleWaiters: Array<() => void> = []
 
@@ -31,6 +33,12 @@ export class FakeAgent {
   }
 
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.startAbortedOnce) {
+      this.startAbortedOnce = false
+      const controller = new AbortController()
+      controller.abort()
+      return Promise.resolve(task(controller.signal))
+    }
     if (this.failClaims > 0) {
       this.failClaims -= 1
       throw new Error('another maintenance task owns this agent')
