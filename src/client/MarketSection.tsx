@@ -58,7 +58,7 @@ import {
   formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
 } from './market-data.ts'
 import type {
-ActivationInfo, ActivationState, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, MarketStatus, Registry, RegistryPlugin,
+ActivationInfo, ActivationState, DrainHistoryWire, DrainOperationWire, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, MarketStatus, Registry, RegistryPlugin,
   HostCompatibility, HostCompatibilityMap, ScreenshotCandidate, ScreenshotMeasurement, SharedHostPackageDependencyFinding, SortDir, SortField, ThemeSnapshot, TimeRange, Translate, UpdateStatus,
 } from './market-data.ts'
 
@@ -2287,7 +2287,10 @@ export function MarketSection(props: MarketSectionProps) {
     if (!queueRestoredRef.current) return
     try {
       const queued = records
-        .filter(record => record.state === 'queued')
+        // Host-owned rows are persisted by the Host, not replayed from this
+        // key: writing them here would let a later page run the operation
+        // itself and bypass the maintenance barrier (#411).
+        .filter(record => record.state === 'queued' && record.hostOperationId === undefined)
         .map(record => ({ kind: record.kind, name: record.name, ...(record.url === undefined ? {} : { url: record.url }), ...(record.updateOptions === undefined ? {} : { updateOptions: record.updateOptions }) }))
       if (queued.length === 0) localStorage.removeItem('dshm-queue-v1')
       else localStorage.setItem('dshm-queue-v1', JSON.stringify(queued))
@@ -2870,7 +2873,12 @@ export function MarketSection(props: MarketSectionProps) {
    * `runningAgents` gates the agent-file guard. A ref (not state) because the
    * drain interval is mount-once and must never read a stale closure.
    */
-  const statusRef = useRef<{ busy: boolean; runningAgents: string[] }>({ busy: false, runningAgents: [] })
+  const statusRef = useRef<{ busy: boolean; runningAgents: string[]; agentDrain: boolean; boot: string | null }>({
+    busy: false,
+    runningAgents: [],
+    agentDrain: false,
+    boot: null,
+  })
   /** True while the drain is executing one queued request (no parallel starts). */
   const drainingRef = useRef(false)
 
@@ -2929,6 +2937,206 @@ export function MarketSection(props: MarketSectionProps) {
       })
       .catch(() => {})
   }, [setActivations, setBlockedNames, setDisabledNames, setFavoriteUrls, setInstalledBundles, setInstalledFiles, setSkins, setUpdates])
+
+  /**
+   * Host-owned deferred operations (#411).
+   *
+   * These rows are projections of `/status`, never entries in the client
+   * queue: the Host owns the maintenance holds, and re-running a row here
+   * would start a second mutation outside that barrier. `dshm-drain-v1`
+   * remembers only which operations this page asked for, so a Host restart can
+   * say "that one was cancelled" instead of leaving the user to guess.
+   */
+  const settledHostRef = useRef(new Set<string>())
+  const knownHostIdsRef = useRef(new Set<string>())
+  const drainMarkerRestoredRef = useRef(false)
+
+  const clearDrainMarker = useCallback((operationId: string) => {
+    try {
+      const raw = localStorage.getItem('dshm-drain-v1')
+      if (raw === null) return
+      const parsed = JSON.parse(raw) as unknown
+      if (!Array.isArray(parsed)) return
+      const kept = parsed.filter(entry => (entry as { id?: unknown } | null)?.id !== operationId)
+      if (kept.length === 0) localStorage.removeItem('dshm-drain-v1')
+      else localStorage.setItem('dshm-drain-v1', JSON.stringify(kept))
+    } catch { /* storage unavailable — the Host record is still the source of truth */ }
+  }, [])
+
+  const rememberDrainMarker = useCallback((operation: { operationId: string; kind: string; name: string; url?: string }) => {
+    try {
+      const raw = localStorage.getItem('dshm-drain-v1')
+      const parsed = raw === null ? [] : JSON.parse(raw) as unknown
+      const list = Array.isArray(parsed) ? parsed : []
+      if (list.some(entry => (entry as { id?: unknown } | null)?.id === operation.operationId)) return
+      list.push({
+        id: operation.operationId,
+        kind: operation.kind,
+        name: operation.name,
+        ...(operation.url === undefined ? {} : { url: operation.url }),
+      })
+      localStorage.setItem('dshm-drain-v1', JSON.stringify(list))
+    } catch { /* storage unavailable — the Host record still projects the row */ }
+  }, [])
+
+  /** Mark operations this page started in an earlier boot as cancelled by restart. */
+  const restoreDrainMarkers = useCallback((status: MarketStatus) => {
+    if (drainMarkerRestoredRef.current) return
+    const boot = typeof status.boot === 'string' ? status.boot : null
+    if (boot === null) return
+    drainMarkerRestoredRef.current = true
+    let saved: unknown = null
+    try { saved = JSON.parse(localStorage.getItem('dshm-drain-v1') ?? 'null') } catch { saved = null }
+    if (!Array.isArray(saved) || saved.length === 0) return
+    const stale = saved.filter((entry): entry is { id: string; kind?: unknown; name?: unknown; url?: unknown } => {
+      if (entry === null || typeof entry !== 'object') return false
+      const id = (entry as { id?: unknown }).id
+      return typeof id === 'string' && !id.startsWith(`${boot}-`)
+    })
+    if (stale.length > 0) {
+      setRecords(previous => {
+        let next = previous
+        for (const entry of stale) {
+          if (next.some(record => record.hostOperationId === entry.id || record.id === `host-${entry.id}`)) continue
+          const kind = entry.kind === 'install' || entry.kind === 'update' || entry.kind === 'uninstall'
+            ? entry.kind : 'update'
+          next = enqueue(next, {
+            id: `host-${entry.id}`,
+            kind,
+            name: typeof entry.name === 'string' ? entry.name : 'plugin',
+            ...(typeof entry.url === 'string' ? { url: entry.url } : {}),
+            hostOperationId: entry.id,
+            state: 'failed',
+            reason: t('agentDrainRestarted'),
+          })
+        }
+        return next
+      })
+      setOperationsOpen(true)
+    }
+    try { localStorage.removeItem('dshm-drain-v1') } catch { /* storage unavailable */ }
+  }, [t])
+
+  /** Project Host-owned operations into the Tasks panel. */
+  const applyDrainStatus = useCallback((status: MarketStatus) => {
+    const operations: DrainOperationWire[] = Array.isArray(status.drainOperations) ? status.drainOperations : []
+    const history: DrainHistoryWire[] = Array.isArray(status.drainHistory) ? status.drainHistory : []
+    if (operations.length === 0 && history.length === 0) return
+
+    // A page reopened while the Host is still working should show the waiting
+    // task immediately. Only a newly seen operation raises the panel; a later
+    // poll must not reopen it after the user closed it.
+    let opened = false
+    for (const operation of operations) {
+      if (operation.state === 'accepted' || operation.state === 'draining'
+        || operation.state === 'queued-for-mutation' || operation.state === 'running'
+        || operation.state === 'verifying') {
+        if (!knownHostIdsRef.current.has(operation.operationId)) {
+          knownHostIdsRef.current.add(operation.operationId)
+          opened = true
+        }
+      }
+    }
+
+    for (const operation of operations) {
+      if (operation.state !== 'succeeded' && operation.state !== 'failed' && operation.state !== 'cancelled') continue
+      clearDrainMarker(operation.operationId)
+      if (settledHostRef.current.has(operation.operationId)) continue
+      settledHostRef.current.add(operation.operationId)
+      if (operation.state === 'succeeded') {
+        refreshInstalled()
+        if (operation.outcome?.restartRequired === true) {
+          setRestartNames(names => names.includes(operation.name) ? names : names.concat(operation.name))
+        }
+        if (operation.kind === 'update') {
+          setUpdatedNames(names => names.includes(operation.name) ? names : names.concat(operation.name))
+        }
+        if (operation.kind === 'install' && operation.url !== undefined) {
+          setDoneUrls(urls => urls.includes(operation.url!) ? urls : urls.concat(operation.url!))
+        }
+      } else {
+        refreshInstalled()
+      }
+    }
+
+    const hostRecord = (operation: DrainOperationWire): OperationRecord => {
+      const base = {
+        id: `host-${operation.operationId}`,
+        kind: operation.kind,
+        name: operation.name,
+        ...(operation.url === undefined ? {} : { url: operation.url }),
+        hostOperationId: operation.operationId,
+      }
+      if (operation.state === 'accepted' || operation.state === 'draining' || operation.state === 'queued-for-mutation') {
+        return {
+          ...base,
+          state: 'queued',
+          ...(operation.wait === null ? {} : { blockedBy: operation.wait.activeAgentIds, waitSince: operation.wait.since }),
+          reason: operation.wait === null
+            ? t('agentBusyQueued')
+            : t('agentDrainWaiting').replace('{0}', String(operation.wait.activeCount)),
+        }
+      }
+      if (operation.state === 'running') {
+        return { ...base, state: 'running', blockedBy: undefined, waitSince: undefined, reason: undefined }
+      }
+      if (operation.state === 'verifying') {
+        return { ...base, state: 'running', detail: t('agentDrainVerifying'), blockedBy: undefined, waitSince: undefined, reason: undefined }
+      }
+      if (operation.state === 'succeeded') {
+        return {
+          ...base,
+          state: 'done',
+          needsRefresh: operation.outcome?.needsRefresh === true,
+          blockedBy: undefined,
+          waitSince: undefined,
+          reason: undefined,
+        }
+      }
+      if (operation.state === 'cancelled') {
+        return { ...base, state: 'failed', reason: t('agentDrainCancelled'), blockedBy: undefined, waitSince: undefined }
+      }
+      return {
+        ...base,
+        state: 'failed',
+        reason: operation.failure?.message ?? t('installFail'),
+        blockedBy: undefined,
+        waitSince: undefined,
+      }
+    }
+
+    setRecords(previous => {
+      let next = previous
+      for (const operation of operations) {
+        const existing = next.find(record => record.hostOperationId === operation.operationId)
+        const desired = hostRecord(operation)
+        if (existing === undefined) {
+          next = enqueue(next, desired)
+        } else {
+          const { id: _id, kind: _kind, name: _name, hostOperationId: _host, ...changes } = desired
+          next = patchRecord(next, existing.id, changes)
+        }
+      }
+      for (const entry of history) {
+        const id = `host-${entry.id}`
+        if (next.some(record => record.id === id || record.hostOperationId === entry.id)) continue
+        if (entry.state === 'succeeded') {
+          next = enqueue(next, { id, kind: entry.kind, name: entry.name, hostOperationId: entry.id, state: 'done' })
+        } else {
+          next = enqueue(next, {
+            id,
+            kind: entry.kind,
+            name: entry.name,
+            hostOperationId: entry.id,
+            state: 'failed',
+            reason: entry.state === 'cancelled' ? t('agentDrainHistoryCancelled') : t('agentDrainHistoryFailedShort'),
+          })
+        }
+      }
+      return next
+    })
+    if (opened) setOperationsOpen(true)
+  }, [clearDrainMarker, refreshInstalled, t])
 
   /** Active Bundles count as installed in Discover without becoming package-manager targets. */
   const catalogInstalled = useMemo(
@@ -3096,7 +3304,11 @@ export function MarketSection(props: MarketSectionProps) {
         statusRef.current = {
           busy: status.busy === true,
           runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
+          agentDrain: status.agentDrain === true,
+          boot: typeof status.boot === 'string' ? status.boot : null,
         }
+        applyDrainStatus(status)
+        restoreDrainMarkers(status)
         setEnvReady(status.pnpm !== false)
         // Applied before anything renders a github.com URL. The catalog this
         // page draws from is a larger request through the same server, so it
@@ -3123,7 +3335,7 @@ export function MarketSection(props: MarketSectionProps) {
       })
       .catch(() => {})
     refreshInstalled()
-  }, [refreshInstalled, loadCatalog, readMarketStatus])
+  }, [applyDrainStatus, refreshInstalled, loadCatalog, readMarketStatus, restoreDrainMarkers])
 
   // Pending-restart flags survive tab switches and page reloads, scoped to
   // one host process: a different boot id means the restart happened and the
@@ -3255,7 +3467,11 @@ export function MarketSection(props: MarketSectionProps) {
           statusRef.current = {
             busy: status.busy === true,
             runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
+            agentDrain: status.agentDrain === true,
+            boot: typeof status.boot === 'string' ? status.boot : null,
           }
+          applyDrainStatus(status)
+          restoreDrainMarkers(status)
           setHostBusy(status.busy === true)
           setDebuggerLatch(typeof status.debugger === 'string' ? status.debugger : null)
           if (status.active) {
@@ -3374,7 +3590,7 @@ export function MarketSection(props: MarketSectionProps) {
         .catch(() => {})
     }, 2000)
     return () => clearInterval(timer)
-  }, [busyUrl, updatingName, data, installed, repoIdentities, repoHints, refreshInstalled, lang, t])
+  }, [applyDrainStatus, busyUrl, updatingName, data, installed, repoIdentities, repoHints, refreshInstalled, lang, restoreDrainMarkers, t])
 
   const scrollToTop = () => {
     const el = bodyRef.current
@@ -3637,7 +3853,7 @@ export function MarketSection(props: MarketSectionProps) {
     return `${first.name} — ${first.layers.join(' / ')}${rest}`
   }
 
-  const doInstall = useCallback((plugin: RegistryPlugin, force = false, version?: string) => {
+  const doInstall = useCallback((plugin: RegistryPlugin, force = false, version?: string, preferReject = false) => {
     setBuildsSkipped(null)
     setConfirming(null)
     setInstallError(null)
@@ -3656,12 +3872,33 @@ export function MarketSection(props: MarketSectionProps) {
       // `version` when the refusal dialog found a release this host supports:
       // the route pins THAT release instead of resolving the newest one —
       // which is the release that was just refused (#581).
-      body: JSON.stringify({ url: plugin.url, ...(force ? { force: true } : {}), ...(version !== undefined ? { version } : {}) }),
+      body: JSON.stringify({
+        url: plugin.url,
+        ...(force ? { force: true } : {}),
+        ...(version !== undefined ? { version } : {}),
+        ...(statusRef.current.agentDrain && !preferReject ? { busyPolicy: 'drain' } : {}),
+      }),
     })
       .then(res => res.json().then(body => ({ status: res.status, body })))
       .then(({ status, body }) => {
         setBusyUrl(null)
         sessionStorage.removeItem('dshm-pending')
+        if (status === 202 && typeof body.operationId === 'string') {
+          const operation = body.operation as DrainOperationWire | undefined
+          setRecords(list => patchRecord(list, recordId, {
+            state: 'queued',
+            hostOperationId: body.operationId,
+            ...(operation?.wait === null || operation?.wait === undefined
+              ? {}
+              : { blockedBy: operation.wait.activeAgentIds, waitSince: operation.wait.since }),
+            reason: operation?.wait === null || operation?.wait === undefined
+              ? t('agentBusyQueued')
+              : t('agentDrainWaiting').replace('{0}', String(operation.wait.activeCount)),
+          }))
+          rememberDrainMarker({ operationId: body.operationId, kind: 'install', name: plugin.name, url: plugin.url })
+          setOperationsOpen(true)
+          return
+        }
         if (status === 200 && body.ok && body.hot && pluginCategories(plugin).includes('theme')) {
           // Themes auto-activate on install; reload straight into the Themes
           // tab so the new look is on screen immediately.
@@ -3722,6 +3959,14 @@ export function MarketSection(props: MarketSectionProps) {
               : { state: 'done', needsRefresh: body.hot !== true }))
           refreshInstalled()
         } else {
+          // The Host lost the drain capability between the status sample and
+          // this request. Fall back to the ordinary reject path once, which
+          // keeps the current 409/queue guidance on that Host (FR-9).
+          if (body.unsupported === true) {
+            setRecords(list => drop(list, recordId))
+            doInstall(plugin, force, version, true)
+            return
+          }
           // A rename the catalog declares and this profile still holds under
           // the former name (#1012): the host refuses to install the successor
           // beside it, because both would register the same loader rows and
@@ -3739,6 +3984,17 @@ export function MarketSection(props: MarketSectionProps) {
             }
           }
           if (status === 409) {
+            if (body.targetChanged === true) {
+              // The Host refused before accepting the drain: the release it
+              // would have installed changed while the confirmation sat.
+              // That is a failure to report, not a lock to queue behind.
+              setRecords(list => patchRecord(list, recordId, {
+                state: 'failed',
+                reason: String(body.error ?? t('installFail')),
+              }))
+              setOperationsOpen(true)
+              return
+            }
             if (body.agentsBusy === true) {
               // Agents-busy is a queue, not a failure: keep the record as
               // `queued` so the drain below runs it when agents go idle.
@@ -3843,7 +4099,7 @@ export function MarketSection(props: MarketSectionProps) {
         // success once the plugin lands (busy-aware since #91) and strikes
         // out genuinely dead installs (#32).
       })
-  }, [nextRecordId, refreshInstalled, t, installed])
+  }, [nextRecordId, refreshInstalled, rememberDrainMarker, t, installed])
 
   /**
    * Resolve a loader-id clash the only way one profile allows: uninstall the
@@ -4050,12 +4306,13 @@ export function MarketSection(props: MarketSectionProps) {
   }, [recovery, recoveryBusy, recoveryKeep, t, enterRecovery])
 
   /** Cancel the running plugin command (#6 by @qichuang321). */
-  const doCancel = useCallback(() => {
-    fetch(api('/dsh-market/cancel'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  const doCancel = useCallback((record?: OperationRecord) => {
+    const body = record?.hostOperationId === undefined ? {} : { operationId: record.hostOperationId }
+    fetch(api('/dsh-market/cancel'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       .catch(() => {})
   }, [])
 
-  const doUpdate = useCallback((name: string, force = false, restore = false, compatVersion?: string, confirmAgentsRunning = false, eligibleVersion?: string) => {
+  const doUpdate = useCallback((name: string, force = false, restore = false, compatVersion?: string, confirmAgentsRunning = false, eligibleVersion?: string, preferReject = false) => {
     const expectedVersion = compatVersion === undefined && !restore
       ? (eligibleVersion ?? updates[name]?.eligibleVersion) : undefined
     const updateOptions = { force, restore, compatVersion, eligibleVersion: expectedVersion }
@@ -4085,7 +4342,17 @@ export function MarketSection(props: MarketSectionProps) {
     return fetch(api('/dsh-market/update'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, ...(force ? { force: true } : {}), ...(restore ? { restore: true } : {}), ...(compatVersion !== undefined ? { compatVersion } : {}), ...(expectedVersion !== undefined ? { eligibleVersion: expectedVersion } : {}), ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}) }),
+      body: JSON.stringify({
+        name,
+        ...(force ? { force: true } : {}),
+        ...(restore ? { restore: true } : {}),
+        ...(compatVersion !== undefined ? { compatVersion } : {}),
+        ...(expectedVersion !== undefined ? { eligibleVersion: expectedVersion } : {}),
+        ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}),
+        // `restore` is deliberately outside drain mode: a local-development
+        // restore keeps its current wait/cancel guidance.
+        ...(!restore && statusRef.current.agentDrain && !preferReject ? { busyPolicy: 'drain' } : {}),
+      }),
     })
       .then(res => res.json().then(body => ({ status: res.status, body })))
       .then(({ status, body }) => {
@@ -4094,6 +4361,22 @@ export function MarketSection(props: MarketSectionProps) {
         // marker + row for the poll to converge.
         sessionStorage.removeItem('dshm-updating')
         setUpdatingName(null)
+        if (status === 202 && typeof body.operationId === 'string') {
+          const operation = body.operation as DrainOperationWire | undefined
+          setRecords(list => patchRecord(list, updateRecordId, {
+            state: 'queued',
+            hostOperationId: body.operationId,
+            ...(operation?.wait === null || operation?.wait === undefined
+              ? {}
+              : { blockedBy: operation.wait.activeAgentIds, waitSince: operation.wait.since }),
+            reason: operation?.wait === null || operation?.wait === undefined
+              ? t('agentBusyUpdateQueued')
+              : t('agentDrainWaiting').replace('{0}', String(operation.wait.activeCount)),
+          }))
+          rememberDrainMarker({ operationId: body.operationId, kind: 'update', name })
+          setOperationsOpen(true)
+          return
+        }
         if (body.cancelled === true) {
           setRecords(list => drop(list, updateRecordId))
           refreshInstalled()
@@ -4151,7 +4434,23 @@ export function MarketSection(props: MarketSectionProps) {
           }
           refreshInstalled()
         } else {
+          if (body.unsupported === true) {
+            // The Host lost the drain capability after the status sample;
+            // retry once on the ordinary reject path (FR-9).
+            setRecords(list => drop(list, updateRecordId))
+            void doUpdate(name, force, restore, compatVersion, confirmAgentsRunning, eligibleVersion, true)
+            return
+          }
           if (status === 409) {
+            if (body.targetChanged === true) {
+              setRecords(list => patchRecord(list, updateRecordId, {
+                state: 'failed',
+                reason: String(body.error ?? 'Update target changed'),
+              }))
+              setInstallError(localizeBilingual(String(body.error ?? 'Update target changed'), lang))
+              setOperationsOpen(true)
+              return
+            }
             if (body.agentsBusy === true) {
               // Same queue treatment as installs: the host refused before
               // touching pnpm, so this becomes a `queued` record the drain
@@ -4231,7 +4530,7 @@ export function MarketSection(props: MarketSectionProps) {
         // running row, and let the status poll converge the outcome instead
         // of declaring a false failure — mirroring the install flow's catch.
       })
-  }, [refreshInstalled, installed, t, lang, updates])
+  }, [refreshInstalled, installed, rememberDrainMarker, t, lang, updates])
 
 
   const doSourceMigration = useCallback((name: string, confirmAgentsRunning = false, renameTo?: string) => {
@@ -4664,7 +4963,7 @@ export function MarketSection(props: MarketSectionProps) {
     setRefreshNames(names => names.filter(entry => entry !== name))
   }, [])
 
-  const doUninstall = useCallback((name: string, confirmAgentsRunning = false) => {
+  const doUninstall = useCallback((name: string, confirmAgentsRunning = false, preferReject = false) => {
     setRemoveConfirm(null)
     setInstallError(null)
     setActivationWarnings([])
@@ -4676,10 +4975,45 @@ export function MarketSection(props: MarketSectionProps) {
     return fetch(api('/dsh-market/uninstall'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}) }),
+      body: JSON.stringify({
+        name,
+        ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}),
+        ...(statusRef.current.agentDrain && !preferReject ? { busyPolicy: 'drain' } : {}),
+      }),
     })
       .then(res => res.json().then(body => ({ status: res.status, body })))
       .then(({ status, body }) => {
+        if (status === 202 && typeof body.operationId === 'string') {
+          const operation = body.operation as DrainOperationWire | undefined
+          setRecords(list => patchRecord(list, uninstallRecordId, {
+            state: 'queued',
+            hostOperationId: body.operationId,
+            ...(operation?.wait === null || operation?.wait === undefined
+              ? {}
+              : { blockedBy: operation.wait.activeAgentIds, waitSince: operation.wait.since }),
+            reason: operation?.wait === null || operation?.wait === undefined
+              ? t('agentBusyUninstallQueued')
+              : t('agentDrainWaiting').replace('{0}', String(operation.wait.activeCount)),
+          }))
+          rememberDrainMarker({ operationId: body.operationId, kind: 'uninstall', name })
+          setOperationsOpen(true)
+          return
+        }
+        if (body.unsupported === true) {
+          // The Host lost the drain capability after the status sample;
+          // retry once on the ordinary reject path (FR-9).
+          setRecords(list => drop(list, uninstallRecordId))
+          void doUninstall(name, confirmAgentsRunning, true)
+          return
+        }
+        if (status === 409 && body.targetChanged === true) {
+          setRecords(list => patchRecord(list, uninstallRecordId, {
+            state: 'failed',
+            reason: String(body.error ?? t('installFail')),
+          }))
+          setOperationsOpen(true)
+          return
+        }
         if (status === 409 && body.agentsBusy === true) {
           setRecords(list => patchRecord(list, uninstallRecordId, {
             state: 'queued',
@@ -4733,7 +5067,7 @@ export function MarketSection(props: MarketSectionProps) {
       .finally(() => setRemovingName(null))
     // hotNames/refreshNames are read above to tell a plugin this page loaded
     // from one installed inside it, so they belong in the closure.
-  }, [refreshInstalled, hotNames, refreshNames, nextRecordId, t])
+  }, [refreshInstalled, hotNames, refreshNames, nextRecordId, rememberDrainMarker, t])
 
   // Drain-loop refs, assigned after doInstall/doUpdate/doUninstall exist
   // (the mount-once drain effect below only reads refs, never closures).
@@ -4806,18 +5140,36 @@ export function MarketSection(props: MarketSectionProps) {
       // before asking whether anything was queued, so an open page polled
       // /status every 2 s for as long as it stayed open, queue or no queue
       // (#838). Ask first — with no record there is nothing to drain.
-      if (!recordsRef.current.some(record => record.state === 'queued')) return
+      const hasWork = recordsRef.current.some(record =>
+        record.hostOperationId === undefined
+          ? record.state === 'queued'
+          : record.state === 'queued' || record.state === 'running')
+      if (!hasWork) return
       void fetch(api('/dsh-market/status'), { cache: 'no-store' })
         .then(readMarketStatus)
         .then(status => {
           if (disposed || status === null) return
           const runningAgents: string[] = Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : []
           const busy = status.busy === true
-          statusRef.current = { busy, runningAgents }
+          statusRef.current = {
+            busy,
+            runningAgents,
+            agentDrain: status.agentDrain === true,
+            boot: typeof status.boot === 'string' ? status.boot : null,
+          }
+          applyDrainStatus(status)
+          restoreDrainMarkers(status)
           if (busy) return
+          // A Host-owned operation owns the lane. Client-queued rows must not
+          // start beside it: the Host's maintenance barrier is what makes the
+          // package command safe.
+          if (status.drainActive === true) return
           if (operationInFlight()) return
-          const task = recordsRef.current.find(record => record.state === 'queued' && (record.kind === 'install' || runningAgents.length === 0))
-          if (task === undefined || recordsRef.current.some(record => record.state === 'running')) return
+          const task = recordsRef.current.find(record =>
+            record.state === 'queued'
+            && record.hostOperationId === undefined
+            && (record.kind === 'install' || runningAgents.length === 0))
+          if (task === undefined || recordsRef.current.some(record => record.state === 'running' && record.hostOperationId === undefined)) return
           setRecords(list => list.filter(record => record.id !== task.id))
           drainingRef.current = true
           try {
@@ -4839,10 +5191,13 @@ export function MarketSection(props: MarketSectionProps) {
       disposed = true
       clearInterval(timer)
     }
-  }, [readMarketStatus])
+  }, [applyDrainStatus, readMarketStatus, restoreDrainMarkers])
 
   /** A queued record's "run now": retry immediately instead of waiting for idle. */
   const runQueuedNow = useCallback((record: OperationRecord, confirmAgentsRunning = false) => {
+    // A Host-owned row is already being coordinated; running it here would
+    // start a second mutation outside the maintenance barrier.
+    if (record.hostOperationId !== undefined) return
     if (!recordsRef.current.some(item => item.id === record.id && item.state === 'queued')) return
     if (record.kind !== 'install' && !confirmAgentsRunning &&
         (statusRef.current.runningAgents.length > 0 || (record.blockedBy?.length ?? 0) > 0)) {
@@ -5824,7 +6179,7 @@ export function MarketSection(props: MarketSectionProps) {
             ? (
                 <button type="button" className={css.cardBlockedMark} onClick={openOperations}>
                   <IconWarningOutline16 size={13} />
-                  {t('queuedBadge')}
+                  {t(record?.hostOperationId !== undefined && (record.blockedBy?.length ?? 0) > 0 ? 'agentDrainBadge' : 'queuedBadge')}
                 </button>
               )
             : blocked
@@ -5980,7 +6335,7 @@ export function MarketSection(props: MarketSectionProps) {
             <span className={css.spin}><IconLoadingOutline16 size={14} /></span>
             <code className={css.grow}>{progressText}</code>
             {progressPct !== null && <span className={css.pct}>{progressPct}%</span>}
-            <Button variant="outline" size="sm" disabled={cancelling} onClick={doCancel}>
+            <Button variant="outline" size="sm" disabled={cancelling} onClick={() => doCancel()}>
               {cancelling ? t('cancelling') : t('cancelOp')}
             </Button>
             <div className={css.bar}>
@@ -6085,7 +6440,7 @@ export function MarketSection(props: MarketSectionProps) {
                       ? (
                           <button type="button" className={css.cardBlockedMark} onClick={openOperations}>
                             <IconWarningOutline16 size={13} />
-                            {t('queuedBadge')}
+                            {t(record?.hostOperationId !== undefined && (record.blockedBy?.length ?? 0) > 0 ? 'agentDrainBadge' : 'queuedBadge')}
                           </button>
                         )
                       : blocked
@@ -6129,7 +6484,7 @@ export function MarketSection(props: MarketSectionProps) {
               <span className={css.spin}><IconLoadingOutline16 size={14} /></span>
               <code className={css.grow}>{progressText}</code>
               {progressPct !== null && <span className={css.pct}>{progressPct}%</span>}
-              <Button variant="outline" size="sm" disabled={cancelling} onClick={doCancel}>
+              <Button variant="outline" size="sm" disabled={cancelling} onClick={() => doCancel()}>
                 {cancelling ? t('cancelling') : t('cancelOp')}
               </Button>
               <div className={css.bar}>
@@ -6478,7 +6833,7 @@ export function MarketSection(props: MarketSectionProps) {
             replacing={replacing}
             envReady={envReady}
             onClearSettled={() => setRecords(list => clearSettled(list))}
-            onCancel={() => doCancel()}
+            onCancel={record => doCancel(record)}
             onDismiss={record => setRecords(list => drop(list, record.id))}
             onRefresh={() => location.reload()}
             onResolveConflict={resolveConflict}
@@ -7815,7 +8170,7 @@ export function MarketSection(props: MarketSectionProps) {
                                       <span className={css.spin}><IconLoadingOutline16 size={14} /></span>
                                       <code className={css.grow}>{progressText}</code>
                                       {progressPct !== null && <span className={css.pct}>{progressPct}%</span>}
-                                      <Button variant="outline" size="sm" disabled={cancelling} onClick={doCancel}>
+                                      <Button variant="outline" size="sm" disabled={cancelling} onClick={() => doCancel()}>
                                         {cancelling ? t('cancelling') : t('cancelOp')}
                                       </Button>
                                       <div className={css.bar}>
