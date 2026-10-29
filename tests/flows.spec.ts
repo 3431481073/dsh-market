@@ -10300,6 +10300,38 @@ describe('Agent-safe drain mode (#411)', () => {
     } finally { drainBed.dispose() }
   })
 
+  it('keeps the #path: selector when pinning a global github install', async () => {
+    const sha = 'a'.repeat(40)
+    fake.repos['github:m/mono'] = {
+      name: 'mono-plug-a',
+      manifest: { dsh: {}, main: 'index.js' },
+      artifacts: ['index.js'],
+    }
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/info/refs')) {
+        return new Response(`001e# service=git-upload-pack\n0000${sha} HEAD\n0000`, { status: 200 })
+      }
+      return new Response('{}', { status: 200 })
+    })
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/install', {
+        url: 'https://github.com/m/mono/tree/main/packages/plug-a',
+        busyPolicy: 'drain',
+      })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      agent.finishTurn()
+      const completed = await settled(drainBed, String(accepted.json.operationId))
+      expect(completed.state, JSON.stringify(completed)).toBe('succeeded')
+      const add = fake.calls.filter(call => call[0] === 'add').at(-1)
+      // `githubTargetAtCommit` spells a pinned subpath as
+      // `github:owner/repo#<sha>&path:/sub`, not `...@<sha>#path:`.
+      expect(add?.at(-1)).toBe(`github:m/mono#${sha}&path:/packages/plug-a`)
+      expect(installedSpec('mono-plug-a')).toContain(sha)
+    } finally { drainBed.dispose() }
+  })
+
   it('pins a github update in the global region before a deferred update', async () => {
     const sha = 'a'.repeat(40)
     fake.repos['github:o/blue-whale'] = {
