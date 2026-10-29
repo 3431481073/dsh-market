@@ -816,6 +816,7 @@ import { createOfficialDesktopRuntime } from '../src/official-desktop.ts'
 import { routesFor } from '../src/regions.ts'
 import { setRequestGateSource, setTrustedHostsSource } from '../src/http.ts'
 import type { AgentsServiceLike } from '../src/agents.ts'
+import { FakeAgent, agentsService } from './drain-agent.ts'
 
 type Handler = (request: unknown, response: unknown) => void | Promise<void>
 
@@ -9858,6 +9859,257 @@ describe('Issue #991 Desktop stable npm update route', () => {
     expect(fake.calls.some(call => call[0] === 'add' && call.includes('dsh-loop@1.1.0'))).toBe(true)
     expect(fake.calls.some(call => call.includes(RELEASE_AGE_OVERRIDE))).toBe(false)
     expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+  })
+})
+
+describe('Agent-safe drain mode (#411)', () => {
+  function advanceLatest(version: string): void {
+    fake.npm['dsh-loop'].latest = version
+    fake.npm['dsh-loop'].versions[version] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    const publishedAt = new Date(Date.now() - 3_600_000).toISOString()
+    vi.stubGlobal('fetch', (url: string) => {
+      const u = String(url)
+      if (u.endsWith('/latest') && u.includes('registry.npmjs.org')) {
+        return Promise.resolve(new Response(JSON.stringify({ version }), { status: 200 }))
+      }
+      if (u.includes('registry.npmjs.org')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          'dist-tags': { latest: version },
+          time: { [version]: publishedAt },
+        }), { status: 200 }))
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${u}`))
+    })
+  }
+
+  async function seedInstalledLoop(): Promise<void> {
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    expect((await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })).status).toBe(200)
+  }
+
+  async function settled(testbed: Testbed, operationId: string): Promise<Record<string, unknown>> {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const status = await testbed.dispatch('GET', '/dsh-market/status')
+      const operation = (status.json.drainOperations as Array<Record<string, unknown>> | undefined)
+        ?.find(entry => entry.operationId === operationId)
+      if (operation !== undefined && ['succeeded', 'failed', 'cancelled'].includes(String(operation.state))) return operation
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    throw new Error('drain operation did not settle')
+  }
+
+  it('defers an update while an Agent runs and applies it after idle', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const callsBefore = fake.calls.length
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      const operationId = String(accepted.json.operationId)
+      expect(accepted.json.operation.wait).toMatchObject({ reason: 'agents', activeCount: 1, activeAgentIds: ['main'] })
+      expect(fake.calls.length).toBe(callsBefore)
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+
+      agent.finishTurn()
+      const completed = await settled(drainBed, operationId)
+      expect(completed.state).toBe('succeeded')
+      expect(installedSpec('dsh-loop')).toBe('^1.2.0')
+      expect(fake.calls.length).toBeGreaterThan(callsBefore)
+      expect(agent.cancelCalls).toBe(0)
+      expect(agent.held).toBe(false)
+    } finally { drainBed.dispose() }
+  })
+
+  it('fails TARGET_CHANGED when the registry moves during the wait', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      const operationId = String(accepted.json.operationId)
+      advanceLatest('1.3.0')
+      const callsBefore = fake.calls.length
+
+      agent.finishTurn()
+      const completed = await settled(drainBed, operationId)
+      expect(completed.state).toBe('failed')
+      expect(completed.failure).toMatchObject({ code: 'TARGET_CHANGED' })
+      expect(fake.calls.length).toBe(callsBefore)
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+    } finally { drainBed.dispose() }
+  })
+
+  it('keeps one mutation lane while a deferred operation waits', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status).toBe(202)
+      const second = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+      expect(second.status).toBe(409)
+      expect(second.json.failureCode).toBe('OPERATION_BUSY')
+      expect(second.json.agentsBusy).toBeUndefined()
+
+      agent.finishTurn()
+      await settled(drainBed, String(accepted.json.operationId))
+    } finally { drainBed.dispose() }
+  })
+
+  it('cancels a draining operation without touching the profile', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status).toBe(202)
+      const operationId = String(accepted.json.operationId)
+      const callsBefore = fake.calls.length
+
+      const cancelled = await drainBed.dispatch('POST', '/dsh-market/cancel', { operationId })
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.json.cancelled).toBe(true)
+      const completed = await settled(drainBed, operationId)
+      expect(completed.state).toBe('cancelled')
+      expect(agent.held).toBe(false)
+
+      agent.finishTurn()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(fake.calls.length).toBe(callsBefore)
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+    } finally { drainBed.dispose() }
+  })
+
+  it('holds an Agent created during the drain before its first turn', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const first = new FakeAgent('first', 'running')
+    const agents = [first]
+    const drainBed = createTestbed({}, undefined, agentsService(agents))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status).toBe(202)
+      const late = new FakeAgent('late')
+      agents.push(late)
+      drainBed.emit('agent/created', { agent: late })
+      expect(late.held).toBe(true)
+      expect(() => late.startTurn()).toThrow()
+
+      first.finishTurn()
+      const completed = await settled(drainBed, String(accepted.json.operationId))
+      expect(completed.state).toBe('succeeded')
+    } finally { drainBed.dispose() }
+  })
+
+  it('defers a fresh install while an Agent runs and installs after idle', async () => {
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/install', {
+        url: 'https://github.com/o/dsh-loop',
+        busyPolicy: 'drain',
+      })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      expect(installedSpec('dsh-loop')).toBeUndefined()
+
+      agent.finishTurn()
+      const completed = await settled(drainBed, String(accepted.json.operationId))
+      expect(completed.state).toBe('succeeded')
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+    } finally { drainBed.dispose() }
+  })
+
+  it('defers an uninstall while an Agent runs and removes after idle', async () => {
+    await seedInstalledLoop()
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/uninstall', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+
+      agent.finishTurn()
+      const completed = await settled(drainBed, String(accepted.json.operationId))
+      expect(completed.state).toBe('succeeded')
+      expect(installedSpec('dsh-loop')).toBeUndefined()
+    } finally { drainBed.dispose() }
+  })
+
+  it('keeps the 409 fallback when the host cannot hold Agents', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const drainBed = createTestbed({}, undefined, {
+      list: () => [{ id: 'main', status: 'running' }],
+    })
+    try {
+      expect((await drainBed.dispatch('GET', '/dsh-market/status')).json.agentDrain).toBe(false)
+      const refused = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop', busyPolicy: 'drain' })
+      expect(refused.status).toBe(400)
+      expect(refused.json.unsupported).toBe(true)
+
+      const fallback = await drainBed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+      expect(fallback.status).toBe(409)
+      expect(fallback.json.agentsBusy).toBe(true)
+    } finally { drainBed.dispose() }
+  })
+
+  it('advertises agentDrain only when the maintenance boundary is usable', async () => {
+    const quietBed = createTestbed()
+    const legacyBed = createTestbed({}, undefined, { list: () => [{ id: 'main', status: 'idle' }] })
+    const drainBed = createTestbed({}, undefined, agentsService([new FakeAgent('main')]))
+    try {
+      const quiet = await quietBed.dispatch('GET', '/dsh-market/api/v1/capabilities')
+      expect(quiet.json.features.agentDrain).toBe(false)
+      expect(quiet.json.busyPolicies).toEqual(['reject', 'drain'])
+      expect((await legacyBed.dispatch('GET', '/dsh-market/api/v1/capabilities')).json.features.agentDrain).toBe(false)
+      expect((await drainBed.dispatch('GET', '/dsh-market/api/v1/capabilities')).json.features.agentDrain).toBe(true)
+      expect((await drainBed.dispatch('GET', '/dsh-market/status')).json.agentDrain).toBe(true)
+    } finally {
+      quietBed.dispose()
+      legacyBed.dispose()
+      drainBed.dispose()
+    }
+  })
+
+  it('projects a deferred public update as queued with wait.reason=agents', async () => {
+    await seedInstalledLoop()
+    advanceLatest('1.2.0')
+    const agent = new FakeAgent('main', 'running')
+    const drainBed = createTestbed({}, undefined, agentsService([agent]))
+    try {
+      const accepted = await drainBed.dispatch('POST', '/dsh-market/api/v1/updates', {
+        packageName: 'dsh-loop',
+        busyPolicy: 'drain',
+      })
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202)
+      const operationId = String(accepted.json.operation.operationId)
+      expect(accepted.json.operation.state).toBe('queued')
+      expect(accepted.json.operation.wait).toMatchObject({ reason: 'agents', activeAgentIds: ['main'] })
+
+      agent.finishTurn()
+      let completed: Record<string, unknown> | null = null
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const fetched = await drainBed.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+        completed = fetched.json.operation as Record<string, unknown>
+        if (['succeeded', 'failed', 'cancelled'].includes(String(completed.state))) break
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      expect(completed?.state).toBe('succeeded')
+      expect(installedSpec('dsh-loop')).toBe('^1.2.0')
+    } finally { drainBed.dispose() }
   })
 })
 
